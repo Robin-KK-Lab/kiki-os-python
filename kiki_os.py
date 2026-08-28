@@ -177,6 +177,11 @@ def command(name, category="misc", help_key=None):
     return decorator
 
 
+class DummyColor:
+    def __getattr__(self, name):
+        return ""
+
+
 # 持久化存储文件
 PERSIST_FILE = os.path.join(KIKI_DATA_DIR, "kiki_data.dat")
 
@@ -14899,21 +14904,11 @@ def register(api):
 
         # ===== 核心修改：GUI模式下强制禁用颜色 =====
         if hasattr(self, "gui_app") and self.gui_app:
-
-            class DummyColor:
-                def __getattr__(self, name):
-                    return ""
-
             Fore = DummyColor()
             Style = DummyColor()
         elif COLORAMA_AVAILABLE:
             from colorama import Fore, Style
         else:
-
-            class DummyColor:
-                def __getattr__(self, name):
-                    return ""
-
             Fore = DummyColor()
             Style = DummyColor()
         # ==========================================
