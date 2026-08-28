@@ -1,0 +1,12 @@
+﻿*.exe
+*.msi
+*.dmg
+*.zip
+*.rar
+*.log
+*.tmp
+*.bak
+__pycache__/
+*.pyc
+test_sandbox.py
+~$*
