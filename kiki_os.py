@@ -28,6 +28,7 @@ import signal
 import socketserver
 import sqlite3
 import sys
+import types
 import tempfile
 import threading
 import time
@@ -207,16 +208,13 @@ PERSIST_FILE = os.path.join(KIKI_DATA_DIR, "kiki_data.dat")
 
 # ==================== 沙盒环境工厂函数 ====================
 
-def _create_sandbox_env(use_restricted_open=True):
-    """创建统一的沙盒执行环境，避免重复代码。
-    
+def _create_sandbox_env(use_restricted_open=True, shell=None, allowed_modules=None):
+    """创建统一的沙盒执行环境。
+
     Args:
-        use_restricted_open (bool): 是否限制 open 只能访问临时目录。
-            - True: 使用受限 open (sandbox_open)
-            - False: 使用系统默认 open (用于某些插件场景)
-    
-    Returns:
-        tuple: (safe_sys, safe_builtins, safe_import, safe_eval, safe_exec)
+        use_restricted_open: 是否限制 open 只能访问临时目录。
+        shell: KIKIShell 实例（用于主线程弹窗，但子进程通常不传）。
+        allowed_modules: 允许导入的额外模块列表（子进程使用）。
     """
     import io
     import os
@@ -224,10 +222,22 @@ def _create_sandbox_env(use_restricted_open=True):
     import tempfile
     import traceback
 
-    # ---------- 安全的 sys 代理 ----------
+    if allowed_modules is None:
+        allowed_modules = []
+
+    # 安全白名单
+    SAFE_MODULES = {
+        "math", "random", "time", "datetime", "json", "re", "string",
+        "itertools", "functools", "collections", "copy", "textwrap",
+        "unicodedata", "difflib", "heapq", "bisect", "array", "struct",
+        "enum", "dataclasses", "typing", "abc", "queue",
+        "io", "pathlib", "hashlib", "hmac", "base64", "decimal",
+        "fractions", "statistics", "platform"
+    }
+
+    # 安全 sys 代理
     class SafeSys:
         __slots__ = ("_executable", "_path", "_stderr", "_stdin", "_stdout", "_version")
-
         def __init__(self):
             self._stdout = sys.stdout
             self._stderr = sys.stderr
@@ -235,7 +245,6 @@ def _create_sandbox_env(use_restricted_open=True):
             self._version = sys.version
             self._executable = sys.executable
             self._path = sys.path
-
         def __getattribute__(self, name):
             if name in ("modules", "argv", "exit", "exc_info", "getrefcount"):
                 raise AttributeError(f"沙盒禁止访问 sys.{name}")
@@ -245,7 +254,6 @@ def _create_sandbox_env(use_restricted_open=True):
                 return getattr(sys, name)
             except AttributeError:
                 raise AttributeError(f"sys 没有属性 {name}")
-
         def __setattr__(self, name, value):
             if name == "modules":
                 raise AttributeError("禁止修改 sys.modules")
@@ -255,7 +263,7 @@ def _create_sandbox_env(use_restricted_open=True):
 
     safe_sys = SafeSys()
 
-    # ---------- 受限的 open 函数（用于控制路径） ----------
+    # 受限 open
     def sandbox_open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
         sandbox_temp = tempfile.gettempdir()
         abs_path = os.path.abspath(file)
@@ -263,15 +271,23 @@ def _create_sandbox_env(use_restricted_open=True):
             raise PermissionError(f"沙盒禁止访问 {file} (不在临时目录中)")
         return open(file, mode, buffering, encoding, errors, newline, closefd, opener)
 
-    # ---------- 安全导入（禁止危险模块） ----------
+    # 安全导入
     def safe_import(name, *args, **kwargs):
-        if name in ("os", "subprocess", "kiki_os", "builtins"):
+        # 危险模块
+        if name in ("os", "subprocess", "builtins", "ctypes", "socket",
+                    "select", "signal", "multiprocessing", "threading",
+                    "pty", "tty", "termios", "winreg"):
             raise ImportError(f"沙盒禁止导入: {name}")
         if name == "sys":
             return safe_sys
-        return __import__(name, *args, **kwargs)
+        base_name = name.split(".")[0]
+        # 白名单 + 允许列表
+        if base_name in SAFE_MODULES or base_name in allowed_modules:
+            return __import__(name, *args, **kwargs)
+        # 未白名单且未允许 → 拒绝
+        raise ImportError(f"沙盒禁止导入未白名单模块: {name}")
 
-    # ---------- 安全的 eval / exec 包装器 ----------
+    # eval/exec
     def safe_eval(expr, globals=None, locals=None):
         if globals is None:
             globals = {}
@@ -286,69 +302,34 @@ def _create_sandbox_env(use_restricted_open=True):
             globals["__builtins__"] = safe_builtins
         exec(code, globals, locals)
 
-    # ---------- 安全的内置命名空间 ----------
     safe_builtins = {
-        "print": print,
-        "len": len,
-        "range": range,
-        "list": list,
-        "dict": dict,
-        "tuple": tuple,
-        "set": set,
-        "str": str,
-        "int": int,
-        "float": float,
-        "bool": bool,
-        "abs": abs,
-        "round": round,
-        "sum": sum,
-        "min": min,
-        "max": max,
-        "sorted": sorted,
-        "any": any,
-        "all": all,
-        "enumerate": enumerate,
-        "zip": zip,
-        "open": sandbox_open if use_restricted_open else open,
-        "eval": safe_eval,
-        "exec": safe_exec,
-        "globals": globals,
-        "locals": locals,
-        "hasattr": hasattr,
-        "getattr": getattr,
-        "setattr": setattr,
-        "isinstance": isinstance,
-        "callable": callable,
-        "type": type,
-        "issubclass": issubclass,
-        "dir": dir,
-        "vars": vars,
-        "next": next,
-        "iter": iter,
+        "print": print, "len": len, "range": range, "list": list,
+        "dict": dict, "tuple": tuple, "set": set, "str": str,
+        "int": int, "float": float, "bool": bool, "abs": abs,
+        "round": round, "sum": sum, "min": min, "max": max,
+        "sorted": sorted, "any": any, "all": all, "enumerate": enumerate,
+        "zip": zip, "open": sandbox_open if use_restricted_open else open,
+        "eval": safe_eval, "exec": safe_exec, "globals": globals,
+        "locals": locals, "hasattr": hasattr, "getattr": getattr,
+        "setattr": setattr, "isinstance": isinstance, "callable": callable,
+        "type": type, "issubclass": issubclass, "dir": dir, "vars": vars,
+        "next": next, "iter": iter, "__import__": safe_import,
     }
 
-    # ---------- 禁用 subprocess 和 os 危险函数 ----------
+    # 清理系统模块中的危险函数
     try:
         import subprocess
-
-        class _SandboxPopen:
-            def __init__(self, *args, **kwargs):
-                raise RuntimeError("subprocess.Popen is disabled in sandbox")
-            def __call__(self, *args, **kwargs):
-                raise RuntimeError("subprocess.Popen is disabled in sandbox")
-
-        subprocess.Popen = _SandboxPopen
+        subprocess.Popen = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("subprocess.Popen disabled"))
         for attr in ["call", "check_call", "check_output", "run"]:
             if hasattr(subprocess, attr):
-                setattr(subprocess, attr, lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("subprocess functions disabled in sandbox")))
+                setattr(subprocess, attr, lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("subprocess disabled")))
     except Exception:
         pass
-
     try:
         import os
         for name in ["system", "popen", "spawnl", "spawnle", "spawnlp", "spawnlpe",
-                     "spawnv", "spawnve", "spawnvp", "spawnvpe",
-                     "popen2", "popen3", "popen4", "execl", "execle", "execlp", "execlpe",
+                     "spawnv", "spawnve", "spawnvp", "spawnvpe", "popen2", "popen3",
+                     "popen4", "execl", "execle", "execlp", "execlpe",
                      "execv", "execve", "execvp", "execvpe"]:
             if hasattr(os, name):
                 delattr(os, name)
@@ -361,13 +342,20 @@ def _create_sandbox_env(use_restricted_open=True):
 # ==================== 沙盒执行目标函数（需定义在顶层，确保可被 pickle） ====================
 
 
-def _safe_exec_sandbox_target(code_str, output_queue, file_path=None):
+def _safe_exec_sandbox_target(code_str, output_queue, file_path=None, allowed_modules=None, cwd=None):
     """在子进程中执行 Python 代码（通用沙盒）"""
     import io
+    import os
     import sys
     import traceback
 
-    safe_sys, safe_builtins, safe_import, safe_eval, safe_exec = _create_sandbox_env(use_restricted_open=True)
+    # 切换工作目录（如果指定）
+    if cwd and os.path.isdir(cwd):
+        os.chdir(cwd)
+
+    safe_sys, safe_builtins, safe_import, safe_eval, safe_exec = _create_sandbox_env(
+        use_restricted_open=True, allowed_modules=allowed_modules
+    )
 
     namespace = {
         "__name__": "__sandbox__",
@@ -376,7 +364,6 @@ def _safe_exec_sandbox_target(code_str, output_queue, file_path=None):
         "__main__": None,
         "sys": safe_sys,
     }
-
     sys.stdout = io.StringIO()
     sys.stderr = io.StringIO()
     try:
@@ -561,44 +548,222 @@ def _ai_action_worker(task_queue, result_queue, data_dir):
             continue
 
 
-def _plugin_command_sandbox_target(plugin_path, func_name, args_str, output_queue):
-    """在子进程中加载插件模块，并执行指定的函数"""
-    import io
-    import shlex
+def _run_app_script(app_code, args_str):
+    """生成并执行一个隔离脚本，用于运行应用代码（不导入主模块）"""
+    import subprocess
     import sys
-    import traceback
+    import tempfile
 
-    # 插件沙盒中允许 open（不限制路径），但其他安全限制保持统一
-    safe_sys, safe_builtins, safe_import, safe_eval, safe_exec = _create_sandbox_env(use_restricted_open=False)
+    script = f"""
+import sys
+import shlex
+import builtins
+import inspect
+import traceback
 
-    namespace = {
-        "__name__": "__plugin__",
-        "__file__": plugin_path,
-        "__builtins__": safe_builtins,
-        "sys": safe_sys,
-    }
+# 安全环境定义
+SAFE_MODULES = {{
+    "math", "random", "time", "datetime", "json", "re", "string",
+    "itertools", "functools", "collections", "copy", "textwrap",
+    "unicodedata", "difflib", "heapq", "bisect", "array", "struct",
+    "enum", "dataclasses", "typing", "abc", "queue", "io", "pathlib",
+    "hashlib", "hmac", "base64", "decimal", "fractions", "statistics",
+    "platform", "os", "sys", "subprocess"
+}}
 
-    sys.stdout = io.StringIO()
-    sys.stderr = io.StringIO()
-    try:
-        # 读取插件文件
-        with open(plugin_path, "r") as f:
-            code = f.read()
-        # 执行插件代码（加载模块）
-        exec(compile(code, plugin_path, "exec"), namespace)
-        # 如果插件中有对应的函数，调用它
-        if func_name in namespace:
-            func = namespace[func_name]
-            args_list = shlex.split(args_str) if args_str else []
-            func(args_list)
+def safe_import(name, *args, **kwargs):
+    if name in ("ctypes", "socket", "select", "signal", "multiprocessing",
+                 "threading", "pty", "tty", "termios", "winreg"):
+        raise ImportError(f"沙盒禁止导入: {{name}}")
+    if name == "builtins":
+        return builtins
+    base_name = name.split(".")[0]
+    if base_name not in SAFE_MODULES:
+        raise ImportError(f"沙盒禁止导入未白名单模块: {{name}}")
+    module = __import__(name, *args, **kwargs)
+    # 清理 os 危险函数
+    if name == "os" or name.startswith("os."):
+        for func in ["system", "popen", "spawnl", "spawnle", "spawnlp", "spawnlpe",
+                     "spawnv", "spawnve", "spawnvp", "spawnvpe", "popen2", "popen3",
+                     "popen4", "execl", "execle", "execlp", "execlpe",
+                     "execv", "execve", "execvp", "execvpe"]:
+            if hasattr(module, func):
+                delattr(module, func)
+    # 清理 subprocess 危险函数
+    if name == "subprocess":
+        module.Popen = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("subprocess.Popen disabled"))
+        for func in ["call", "check_call", "check_output", "run"]:
+            if hasattr(module, func):
+                setattr(module, func, lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("subprocess functions disabled")))
+    return module
+
+safe_builtins = dict(builtins.__dict__)
+safe_builtins["__import__"] = safe_import
+for dangerous in ["execfile", "input", "breakpoint", "help"]:
+    safe_builtins.pop(dangerous, None)
+
+namespace = {{
+    "__name__": "__app__",
+    "__file__": "<app>",
+    "__builtins__": safe_builtins,
+}}
+
+try:
+    exec(compile({app_code!r}, "<app>", "exec"), namespace)
+    if "main" in namespace:
+        main_func = namespace["main"]
+        args_str_clean = {args_str!r} if {args_str!r} else ""
+        args_list = shlex.split(args_str_clean) if args_str_clean else []
+        sys.argv = ["app"] + args_list
+        sig = inspect.signature(main_func)
+        param_count = len(sig.parameters)
+        if param_count == 1:
+            main_func(args_str_clean)
+        elif param_count == 2:
+            class FakeShell:
+                username = "sandbox"
+            main_func(args_str_clean, FakeShell())
         else:
-            print(f"⚠️ 插件中未找到函数 {func_name}")
-        out = sys.stdout.getvalue()
-        err = sys.stderr.getvalue()
-        output_queue.put(("result", out, err))
-    except Exception:
-        err = traceback.format_exc()
-        output_queue.put(("exception", err))
+            main_func(args_str_clean)
+    print("SUCCESS")
+except Exception:
+    traceback.print_exc()
+    print("ERROR")
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+
+    if result.returncode != 0 or "ERROR" in result.stdout or "ERROR" in result.stderr:
+        error_msg = (result.stderr + result.stdout).strip()
+        return None, error_msg
+    output = result.stdout.replace("SUCCESS", "").strip()
+    return output, ""
+
+
+def _run_plugin_script(plugin_path, func_name, args_str):
+    """生成并执行一个隔离脚本，用于运行插件命令（不导入主模块）"""
+    import subprocess
+    import sys
+    import tempfile
+    import os
+
+    # 构造脚本内容
+    script = f"""
+import sys
+import io
+import shlex
+import traceback
+
+# 安全导入沙盒环境（从主模块复制，但不导入整个模块）
+# 由于子进程无法直接导入主模块，我们仅使用内置的 _create_sandbox_env 函数定义？
+# 但我们无法导入主模块，所以只能重新实现一个简化版。
+# 为了不复杂化，我们在脚本中直接定义安全环境。
+
+def create_sandbox_env():
+    import builtins
+    import io
+    import sys
+    safe_builtins = {{
+        "print": print,
+        "len": len,
+        "range": range,
+        "list": list,
+        "dict": dict,
+        "tuple": tuple,
+        "set": set,
+        "str": str,
+        "int": int,
+        "float": float,
+        "bool": bool,
+        "abs": abs,
+        "round": round,
+        "sum": sum,
+        "min": min,
+        "max": max,
+        "sorted": sorted,
+        "any": any,
+        "all": all,
+        "enumerate": enumerate,
+        "zip": zip,
+        "open": open,
+        "eval": eval,
+        "exec": exec,
+        "globals": globals,
+        "locals": locals,
+        "hasattr": hasattr,
+        "getattr": getattr,
+        "setattr": setattr,
+        "isinstance": isinstance,
+        "callable": callable,
+        "type": type,
+        "issubclass": issubclass,
+        "dir": dir,
+        "vars": vars,
+        "next": next,
+        "iter": iter,
+    }}
+    return safe_builtins
+
+safe_builtins = create_sandbox_env()
+namespace = {{
+    "__name__": "__plugin__",
+    "__file__": {plugin_path!r},
+    "__builtins__": safe_builtins,
+}}
+
+try:
+    with open({plugin_path!r}, "r", encoding="utf-8") as f:
+        code = f.read()
+    exec(compile(code, {plugin_path!r}, "exec"), namespace)
+
+    func = None
+    if {func_name!r} in namespace:
+        func = namespace[{func_name!r}]
+    else:
+        class FakeAPI:
+            def __init__(self):
+                self.commands = {{}}
+            def register_command(self, name, func, help_text=""):
+                self.commands[name] = func
+            def add_menu_item(self, parent, text, callback):
+                pass
+        fake_api = FakeAPI()
+        if "register" in namespace and callable(namespace["register"]):
+            namespace["register"](fake_api)
+            for cmd_name, f in fake_api.commands.items():
+                if f.__name__ == {func_name!r}:
+                    func = f
+                    break
+
+    if func is None:
+        raise ValueError(f"插件中未找到函数 {{func_name}}")
+
+    args_list = shlex.split({args_str!r}) if {args_str!r} else []
+    result = func(args_list)
+    print("SUCCESS")
+except Exception:
+    traceback.print_exc()
+    print("ERROR")
+"""
+
+    # 执行脚本
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+
+    if result.returncode != 0 or "ERROR" in result.stderr:
+        return None, result.stderr
+    return result.stdout, ""
 
 
 # ===== 新增：独立的后台进程执行函数（避免 pickle） =====
@@ -3782,7 +3947,7 @@ class VirtualFS:
         visited.add(node_id)
         if isinstance(node, File):
             return len(node.content)
-        return sum(self.get_dir_size(child, visited) for child in node.children.values())
+        return sum(self.get_dir_size(child, visited) for child in node._children.values())
 
     def get_total_size(self):
         return self.get_dir_size(self.root)
@@ -7073,6 +7238,7 @@ SWP_SHOWWINDOW = 0x0040
 
 
 # ===================== 自定义 WebView（支持拦截新窗口） =====================
+
 class WebView(QWebEngineView):
     """支持在新标签页中打开链接的 WebView"""
 
@@ -9021,6 +9187,10 @@ class FileManager(ctk.CTkFrame):
         self.file_type_filter = "全部"
         self._perm_cache = {}
         self._stop_loading = False
+        self._search_thread = None      # 后台搜索线程
+        self._search_stop = False       # 停止搜索标志
+        self._search_results = []       # 搜索结果缓存
+        self._search_filter_text = ""   # 搜索关键词
         self._loading_complete = False
         self.icon_cache = {}
         self.history = []
@@ -9235,6 +9405,8 @@ class FileManager(ctk.CTkFrame):
         import os
 
         # 去除可能的前导反斜杠（Windows 下 \C:\...）
+        self._search_stop = False
+        self._search_results = []
         if path.startswith("\\") and len(path) > 2 and path[1:3] == ":\\":
             path = path[1:]
         # 标准化路径
@@ -9432,14 +9604,13 @@ class FileManager(ctk.CTkFrame):
     def _open_host_file(self, full_path):
         """用系统默认程序打开宿主机文件"""
         import subprocess
-
         try:
             if os.name == "nt":
                 os.startfile(full_path)
             else:
                 subprocess.Popen(["xdg-open", full_path])
         except Exception as e:
-            self._print(f"❌ 无法打开文件: {e}")
+            messagebox.showerror("错误", f"无法打开文件: {e}")
 
     # ========== 加载目录 ==========
     def _load(self, p=None, depth=0):
@@ -9733,6 +9904,32 @@ class FileManager(ctk.CTkFrame):
 
         # ===== 宿主机模式 =====
         if self.mode == "host":
+            # 如果是搜索模式，使用搜索路径结果
+            if self._search_paths:
+                for name, (full_path, is_dir) in self._search_paths.items():
+                    if self._stop_loading or not self.winfo_exists():
+                        break
+                    icon = self._get_icon(name, is_dir)
+                    typ = "目录" if is_dir else self._get_type_name(name, False)
+                    if is_dir:
+                        size = ""
+                    else:
+                        try:
+                            size = str(os.path.getsize(full_path))
+                        except OSError:
+                            size = "0"
+                    self.tree.insert(
+                        "",
+                        "end",
+                        text=name,
+                        values=(size, typ),
+                        image=icon,
+                    )
+                self._pending_items = []
+                self._loading_complete = True
+                if self.winfo_exists():
+                    self.cancel_load_btn.configure(text="✅", fg_color="#00aa00", state="disabled")
+                return
             for name in batch:
                 if self._stop_loading or not self.winfo_exists():
                     break
@@ -9898,9 +10095,10 @@ class FileManager(ctk.CTkFrame):
         if not self.winfo_exists():
             return
         self._stop_loading = True
+        self._search_stop = True
         self.cancel_load_btn.configure(text="✅", fg_color="#00aa00", state="disabled")
         if hasattr(self.master, "_show_notification"):
-            self.gui._show_notification("已取消文件加载")
+            self.gui._show_notification("已取消文件加载/搜索")
 
     # ========== 辅助方法（原有） ==========
     def _on_recursive_toggle(self):
@@ -10002,9 +10200,115 @@ class FileManager(ctk.CTkFrame):
         return type_map.get(ext, "文件")
 
     def _do_search(self, event=None):
+        """执行搜索操作"""
         keyword = self.search_var.get().strip()
         self.search_filter = keyword if keyword else None
+
+        # 如果是宿主机模式，则使用宿主机文件系统搜索
+        if self.mode == "host":
+            self._search_host(keyword)
+            return
+
+        # 原有VFS搜索逻辑
         self._load()
+
+    def _search_host(self, keyword):
+        """在宿主机当前目录下搜索文件（后台线程，不阻塞UI）"""
+        import os
+        import threading
+
+        # 清空当前树视图
+        self.tree.delete(*self.tree.get_children())
+        self._search_stop = False
+        self._search_filter_text = keyword
+        self._search_results = []
+
+        if not keyword:
+            # 无关键词则重新加载当前目录
+            self._load_host(self.host_cwd)
+            return
+
+        search_root = self.host_cwd
+        self.cancel_load_btn.configure(text="⏹", fg_color="#cc0000", state="normal")
+
+        def do_search():
+            """后台执行搜索"""
+            import os
+            visited = set()  # 防止符号链接循环
+
+            def collect(dir_path, depth=0):
+                if self._search_stop:
+                    return
+                if depth > 6:  # 防止无限递归
+                    return
+                try:
+                    real = os.path.realpath(dir_path)
+                    if real in visited:
+                        return
+                    visited.add(real)
+                except Exception:
+                    pass
+
+                try:
+                    items = os.listdir(dir_path)
+                except PermissionError:
+                    return
+                except Exception:
+                    return
+
+                for item in sorted(items):
+                    if self._search_stop:
+                        return
+                    full_path = os.path.join(dir_path, item)
+                    # 匹配文件名
+                    if keyword.lower() in item.lower():
+                        self._search_results.append((full_path, item, os.path.isdir(full_path)))
+                    # 递归：跳过符号链接
+                    if os.path.isdir(full_path) and not os.path.islink(full_path):
+                        collect(full_path, depth + 1)
+
+            if self.recursive_var.get():
+                collect(search_root)
+            else:
+                try:
+                    items = os.listdir(search_root)
+                    for item in sorted(items):
+                        if keyword.lower() in item.lower():
+                            full = os.path.join(search_root, item)
+                            self._search_results.append((full, item, os.path.isdir(full)))
+                except Exception:
+                    pass
+
+            # 搜索完成，通过after回调更新UI
+            if not self._search_stop:
+                self.after(0, self._display_host_search_results)
+
+        self._search_thread = threading.Thread(target=do_search, daemon=True)
+        self._search_thread.start()
+
+    def _display_host_search_results(self):
+        """在主线程中显示搜索结果"""
+        if self._search_stop:
+            self.cancel_load_btn.configure(text="✅", fg_color="#00aa00", state="disabled")
+            return
+        self.tree.delete(*self.tree.get_children())
+        for full, name, is_dir in self._search_results:
+            icon = self._get_icon(name, is_dir)
+            typ = "目录" if is_dir else self._get_type_name(name, False)
+            if is_dir:
+                size = ""
+            else:
+                try:
+                    size = str(os.path.getsize(full))
+                except OSError:
+                    size = "0"
+            self.tree.insert("", "end", text=name, values=(size, typ), image=icon)
+        self.cancel_load_btn.configure(text="✅", fg_color="#00aa00", state="disabled")
+        self.pv.set(self.host_cwd)
+        # 如果结果为空，提示
+        if not self._search_results:
+            # 可以在状态栏或通知中显示无结果
+            pass
 
     def _clear_search(self):
         self.search_var.set("")
@@ -10015,16 +10319,53 @@ class FileManager(ctk.CTkFrame):
         p = self.pv.get().strip()
         if not p:
             return
+
+        # ---------- 宿主机模式 ----------
         if self.mode == "host":
-            # 宿主机模式：直接加载
-            self._load_host(p)
+            import os
+            # 如果输入的是完整 Windows 路径且存在
+            if os.path.exists(p):
+                if os.path.isdir(p):
+                    self._load_host(p)
+                else:
+                    self._open_host_file(p)
+                return
+            # 尝试在当前目录下解析相对路径
+            candidate = os.path.join(self.host_cwd, p)
+            if os.path.exists(candidate):
+                if os.path.isdir(candidate):
+                    self._load_host(candidate)
+                else:
+                    self._open_host_file(candidate)
+                return
+            # 路径无效
+            messagebox.showerror("错误", f"路径不存在: {p}")
+            return
+
+        # ---------- VFS 模式 ----------
         else:
-            # VFS 模式：确保路径以 / 开头
             if not p.startswith("/"):
                 p = "/" + p
             self.search_var.set("")
             self.search_filter = None
-            self._load(p)
+
+            node = self.shell.fs.resolve(p, self.username)
+
+            # 如果路径不存在，尝试作为当前目录下的文件打开
+            if node is None:
+                cwd = self.shell.fs.get_abs_path(self.shell.fs.cwd)
+                candidate = f"{cwd}/{p}" if cwd != "/" else f"/{p}"
+                node = self.shell.fs.resolve(candidate, self.username)
+                if node is None:
+                    messagebox.showerror("错误", f"路径不存在: {p}")
+                    return
+                else:
+                    p = candidate
+
+            if isinstance(node, Directory):
+                self._load(p)
+            elif isinstance(node, File):
+                self._open_file(p, node.name)
 
     # ========== 双击打开 ==========
     def _dclick(self, e):
@@ -10091,84 +10432,21 @@ class FileManager(ctk.CTkFrame):
 
         ext = os.path.splitext(name)[1].lower()
         text_exts = {
-            ".txt",
-            ".md",
-            ".log",
-            ".json",
-            ".xml",
-            ".yaml",
-            ".yml",
-            ".toml",
-            ".ini",
-            ".cfg",
-            ".conf",
-            ".csv",
-            ".tsv",
-            ".sql",
-            ".sqlite",
+            ".txt", ".md", ".log", ".json", ".xml", ".yaml", ".yml", ".toml",
+            ".ini", ".cfg", ".conf", ".csv", ".tsv", ".sql", ".sqlite",
         }
         image_exts = {
-            ".jpg",
-            ".jpeg",
-            ".png",
-            ".gif",
-            ".bmp",
-            ".tiff",
-            ".webp",
-            ".svg",
-            ".ico",
+            ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".svg", ".ico",
         }
         audio_exts = {
-            ".mp3",
-            ".wav",
-            ".flac",
-            ".aac",
-            ".ogg",
-            ".oga",
-            ".m4a",
-            ".wma",
-            ".opus",
+            ".mp3", ".wav", ".flac", ".aac", ".ogg", ".oga", ".m4a", ".wma", ".opus",
         }
         video_exts = {
-            ".mp4",
-            ".mkv",
-            ".avi",
-            ".mov",
-            ".wmv",
-            ".flv",
-            ".webm",
-            ".m4v",
-            ".3gp",
-            ".3g2",
-            ".ogv",
-            ".ogm",
-            ".divx",
-            ".xvid",
-            ".mpeg",
-            ".mpg",
-            ".m2v",
-            ".vob",
-            ".ts",
-            ".mts",
-            ".m2ts",
-            ".rm",
-            ".rmvb",
-            ".asf",
-            ".amv",
-            ".drc",
-            ".f4v",
-            ".gifv",
-            ".m4p",
-            ".mjpeg",
-            ".mjpg",
-            ".mxg",
-            ".nsv",
-            ".qt",
-            ".ram",
-            ".roq",
-            ".svi",
-            ".viv",
-            ".vivo",
+            ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
+            ".3gp", ".3g2", ".ogv", ".ogm", ".divx", ".xvid", ".mpeg", ".mpg",
+            ".m2v", ".vob", ".ts", ".mts", ".m2ts", ".rm", ".rmvb", ".asf",
+            ".amv", ".drc", ".f4v", ".gifv", ".m4p", ".mjpeg", ".mjpg", ".mxg",
+            ".nsv", ".qt", ".ram", ".roq", ".svi", ".viv", ".vivo",
         }
         script_exts = {".py", ".sh", ".bat", ".ps1", ".js", ".lua", ".rb", ".pl"}
         web_exts = {".html", ".htm"}
@@ -10177,13 +10455,17 @@ class FileManager(ctk.CTkFrame):
             if content is None:
                 messagebox.showerror("错误", "无法读取文件内容")
                 return
+
+            # 文本文件
             if ext in text_exts:
                 self.gui._open_editor_with_file(full)
-            elif ext in image_exts and HAS_PIL:
+                return  # ✅ 关键：处理完立即返回，不再继续
+
+            # 图片文件
+            if ext in image_exts and HAS_PIL:
                 try:
                     import base64
                     import io
-
                     from PIL import Image
 
                     if content and len(content) > 100:
@@ -10192,12 +10474,11 @@ class FileManager(ctk.CTkFrame):
                             Image.open(io.BytesIO(img_data))
                             win = ImageViewer(self.master, content, name)
                             self.gui._add_window(win)
-                            return
+                            return  # ✅
                         except Exception:
                             pass
                     if sys.platform.startswith("win"):
                         import tempfile
-
                         temp_path = os.path.join(tempfile.gettempdir(), os.path.basename(name))
                         try:
                             with open(temp_path, "wb") as f:
@@ -10206,36 +10487,40 @@ class FileManager(ctk.CTkFrame):
                         except Exception:
                             messagebox.showinfo("图片预览", f"图片文件: {name}\n无法解码显示")
                     else:
-                        messagebox.showinfo(
-                            "图片预览", f"图片文件: {name}\n大小: {len(content)} 字节"
-                        )
+                        messagebox.showinfo("图片预览", f"图片文件: {name}\n大小: {len(content)} 字节")
+                    return  # ✅
                 except Exception as e:
                     messagebox.showerror("错误", f"无法打开图片: {e}")
+                    return
+
+            # 音频文件
             if ext in audio_exts:
                 try:
                     import base64
-
                     if not content:
                         messagebox.showerror("错误", "音频文件为空")
                         return
-                    win = VideoPlayer(self.master, content, name)  # 直接复用播放器
+                    win = VideoPlayer(self.master, content, name)  # 复用播放器
                     self.gui._add_window(win)
+                    return  # ✅
                 except Exception as e:
                     messagebox.showerror("错误", f"无法打开音频: {e}")
-            elif ext in video_exts:
+                    return
+
+            # 视频文件
+            if ext in video_exts:
                 try:
                     import base64
-
                     if not content:
                         messagebox.showerror("错误", "视频文件为空")
                         return
                     win = VideoPlayer(self.master, content, name)
                     self.gui._add_window(win)
+                    return  # ✅
                 except Exception:
                     try:
                         import subprocess
                         import tempfile
-
                         temp_path = os.path.join(tempfile.gettempdir(), os.path.basename(name))
                         try:
                             data = base64.b64decode(content)
@@ -10252,9 +10537,15 @@ class FileManager(ctk.CTkFrame):
                             subprocess.run(["xdg-open", temp_path])
                     except Exception as e2:
                         messagebox.showerror("错误", f"无法打开视频: {e2}")
-            elif ext in script_exts:
+                    return  # ✅
+
+            # 脚本文件
+            if ext in script_exts:
                 self.gui._open_editor_with_file(full)
-            elif ext in web_exts:
+                return  # ✅
+
+            # 网页文件
+            if ext in web_exts:
                 try:
                     import base64
                     import os
@@ -10274,17 +10565,20 @@ class FileManager(ctk.CTkFrame):
                         self.gui._add_window(win)
                     else:
                         webbrowser.open(f"file://{temp_path}")
+                    return  # ✅
                 except Exception as e:
                     messagebox.showerror("错误", f"无法打开网页: {e}")
+                    return
+
+            # 兜底：未知类型
+            if messagebox.askyesno(
+                "打开文件", f"'{name}' 不是常见文件类型，是否用文本编辑器打开？"
+            ):
+                self.gui._open_editor_with_file(full)
             else:
-                if messagebox.askyesno(
-                    "打开文件", f"'{name}' 不是常见文件类型，是否用文本编辑器打开？"
-                ):
-                    self.gui._open_editor_with_file(full)
-                else:
-                    messagebox.showinfo(
-                        name, content[:2000] + ("..." if len(content) > 2000 else "")
-                    )
+                messagebox.showinfo(
+                    name, content[:2000] + ("..." if len(content) > 2000 else "")
+                )
         except Exception as e:
             messagebox.showerror("错误", f"打开文件失败: {e}")
 
@@ -10311,10 +10605,121 @@ class FileManager(ctk.CTkFrame):
             m.add_command(label="删除", command=self._del)
             m.add_command(label="重命名", command=self._rename)
             m.add_separator()
+            m.add_command(label="创建桌面快捷方式", command=lambda: self._create_desktop_shortcut())
+            # 判断当前选中的是文件还是文件夹
+            sel = self.tree.selection()
+            has_selection = bool(sel)
+            is_file = False
+            if sel:
+                item = sel[0]
+                display_name = self.tree.item(item, "text")
+                if display_name.startswith("🔒 "):
+                    display_name = display_name[2:]
+                full = self.path + "/" + display_name if self.path != "/" else "/" + display_name
+                node = self.shell.fs.resolve(full, self.username)
+                if node and isinstance(node, File):
+                    is_file = True
+            if has_selection:
+                m.add_command(label="用 KIKI OS 编辑器打开",
+                              command=lambda: self._open_with_kiki_editor(),
+                              state="normal" if is_file else "disabled")
+                m.add_command(label="压缩所选", command=lambda: self._compress_selected())
+            else:
+                m.add_command(label="用 KIKI OS 编辑器打开", state="disabled")
+                m.add_command(label="压缩所选", state="disabled")
+            m.add_separator()
             m.add_command(label="🛡️ 扫描病毒", command=self._scan_virus)
             m.add_separator()
             m.add_command(label="属性", command=self._show_properties)
         m.post(e.x_root, e.y_root)
+
+    def _compress_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选择文件或文件夹")
+            return
+        item = sel[0]
+        display_name = self.tree.item(item, "text")
+        if display_name.startswith("🔒 "):
+            display_name = display_name[2:]
+        full = self.path + "/" + display_name if self.path != "/" else "/" + display_name
+        # 调用压缩命令
+        self.shell._execute(f"compress {full}")
+        # 压缩后刷新
+        self._load()
+
+    def _open_with_kiki_editor(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选择文件")
+            return
+        item = sel[0]
+        display_name = self.tree.item(item, "text")
+        if display_name.startswith("🔒 "):
+            display_name = display_name[2:]
+        full = self.path + "/" + display_name if self.path != "/" else "/" + display_name
+        self.gui._open_editor_with_file(full)
+
+    def _create_desktop_shortcut(self, event=None):
+        """在当前选中文件上创建桌面快捷方式"""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选择文件或文件夹")
+            return
+        item = sel[0]
+        display_name = self.tree.item(item, "text")
+        if display_name.startswith("🔒 "):
+            display_name = display_name[2:]
+        full = self.path + "/" + display_name if self.path != "/" else "/" + display_name
+        if hasattr(self.gui, "_add_desktop_icon"):
+            self.gui._add_desktop_icon(full, display_name)
+            self.gui._show_notification(f"已创建桌面快捷方式: {display_name}")
+        else:
+            messagebox.showerror("错误", "桌面功能不可用")
+
+    def _open_with_notepad(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选择文件")
+            return
+        item = sel[0]
+        display_name = self.tree.item(item, "text")
+        if display_name.startswith("🔒 "):
+            display_name = display_name[2:]
+        full = self.path + "/" + display_name if self.path != "/" else "/" + display_name
+        node = self.shell.fs.resolve(full, self.username)
+        if node is None:
+            messagebox.showinfo("提示", "无法找到文件")
+            return
+        if isinstance(node, Directory):
+            messagebox.showinfo("提示", "文件夹不能使用记事本打开")
+            return
+        try:
+            content = self.shell.fs.read_file(full, self.username)
+            if content is None:
+                node = self.shell.fs.resolve(full, self.username)
+                if node and hasattr(node, "read"):
+                    raw = node.read()
+                    content = raw.decode("utf-8", errors="ignore") if raw else ""
+            if content is None:
+                messagebox.showinfo("提示", "无法读取文件内容")
+                return
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="ignore")
+            if not isinstance(content, str):
+                content = str(content)
+        except Exception as e:
+            messagebox.showinfo("提示", f"读取文件失败: {e}")
+            return
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as f:
+            f.write(content.encode("utf-8"))
+            temp_path = f.name
+        import subprocess
+        if sys.platform == "win32":
+            subprocess.Popen(["notepad.exe", temp_path])
+        else:
+            subprocess.Popen(["xdg-open", temp_path])
 
     # ========== 拖拽相关 ==========
     def _on_drag_start(self, event):
@@ -10402,7 +10807,7 @@ class FileManager(ctk.CTkFrame):
                 x2 = x1 + desktop_frame.winfo_width()
                 y2 = y1 + desktop_frame.winfo_height()
                 if x1 <= x_root <= x2 and y1 <= y_root <= y2:
-                    self._create_desktop_shortcut(event)
+                    self._create_desktop_shortcut()
 
         self._cleanup_drag()
 
@@ -10482,38 +10887,6 @@ class FileManager(ctk.CTkFrame):
                     else:
                         name = display_name
                     child.config(text=f"{'📁' if display_name.startswith('📁') else '📄'} {name}")
-
-    def _create_desktop_shortcut(self, event):
-        if not self.drag_item:
-            return
-        display_name = self.tree.item(self.drag_item, "text")
-        if display_name.startswith(("🔒 ", "📁 ", "📄 ")):
-            name = display_name[2:]
-        else:
-            name = display_name
-        src_path = self.path + "/" + name if self.path != "/" else "/" + name
-        trash_path = f"/home/{self.username}/.trash"
-        if src_path.startswith(trash_path):
-            messagebox.showinfo("提示", "回收站中的文件不能创建桌面快捷方式")
-            return
-        src_node = self.shell.fs.resolve(src_path, self.username)
-        if src_node is None:
-            messagebox.showerror("错误", "源文件已不存在")
-            return
-        if not messagebox.askyesno(
-            "创建桌面快捷方式",
-            f"是否在桌面上创建 '{name}' 的快捷方式？",
-            icon="question",
-        ):
-            return
-
-        # 🟢 核心修复：这里必须用 self.gui，不能用 self.master！
-        if hasattr(self.gui, "_add_desktop_icon"):
-            self.gui._add_desktop_icon(src_path, name)
-            self.gui._show_notification(f"已在桌面创建快捷方式: {name}")
-        else:
-            # 如果还没有 add_desktop_icon（比如系统还在加载），给出更明确的提示
-            messagebox.showerror("错误", "桌面功能不可用")
 
     def _perform_desktop_drop(self, target, event):
         if not self.drag_item:
@@ -10777,7 +11150,7 @@ class FileManager(ctk.CTkFrame):
 
             def copy_dir_tree(n):
                 children = {}
-                for cname, child in n.children.items():
+                for cname, child in n._children.items():
                     if isinstance(child, File):
                         children[cname] = {
                             "type": "file",
@@ -10824,71 +11197,126 @@ class FileManager(ctk.CTkFrame):
         item = sel[0]
         display_name = self.tree.item(item, "text")
         if display_name.startswith("🔒 "):
-            name = display_name[2:]
-        else:
-            name = display_name
+            display_name = display_name[2:]
 
         if self.mode == "host":
-            full_path = os.path.join(self.host_cwd, name)
-            if not os.path.exists(full_path):
+            full = os.path.join(self.host_cwd, display_name)
+            if not os.path.exists(full):
                 messagebox.showerror("错误", "文件或目录不存在")
+                return
+            is_dir = os.path.isdir(full)
+            if is_dir:
+                messagebox.showinfo("提示", "宿主机目录剪切暂不支持，请使用复制")
+                return
+            try:
+                with open(full, "rb") as f:
+                    content = f.read()
+            except Exception as e:
+                messagebox.showerror("错误", f"读取文件失败: {e}")
                 return
             self.clipboard = {
                 "type": "host",
-                "path": full_path,
-                "name": name,
-                "is_dir": os.path.isdir(full_path),
-            }
-            self.cut_mode = True
-            self._show_notification(f"已剪切: {name}")
-            return
-
-        # VFS 模式
-        full_path = self.path + "/" + name if self.path != "/" else "/" + name
-        node = self.shell.fs.resolve(full_path, self.username)
-        if node is None:
-            messagebox.showerror("错误", "文件或目录不存在")
-            self.clipboard = None
-            self.cut_mode = False
-            return
-        if isinstance(node, File):
-            self.clipboard = {
-                "type": "vfs",
-                "path": full_path,
-                "name": node.name,
-                "content": node.content,
-                "mode": node.mode,
+                "path": full,
+                "name": display_name,
                 "is_dir": False,
+                "content": content,
             }
+            try:
+                os.remove(full)
+                self._show_notification(f"已剪切: {display_name}")
+            except Exception as e:
+                messagebox.showerror("错误", f"剪切失败: {e}")
+                return
         else:
-
-            def get_children(n):
-                result = {}
-                for cname, child in n.children.items():
-                    if isinstance(child, File):
-                        result[cname] = {
-                            "type": "file",
-                            "content": child.content,
-                            "mode": child.mode,
-                        }
-                    else:
-                        result[cname] = {
-                            "type": "dir",
-                            "children": get_children(child),
-                            "mode": child.mode,
-                        }
-                return result
-
-            self.clipboard = {
+            # VFS 模式
+            full = self.path + "/" + display_name if self.path != "/" else "/" + display_name
+            node = self.shell.fs.resolve(full, self.username)
+            if node is None:
+                messagebox.showerror("错误", "文件或目录不存在")
+                return
+            is_dir = isinstance(node, Directory)
+            clipboard_data = {
                 "type": "vfs",
-                "path": full_path,
-                "name": node.name,
-                "children": get_children(node),
-                "mode": node.mode,
-                "is_dir": True,
+                "path": full,
+                "name": display_name,
+                "is_dir": is_dir,
             }
+            if is_dir:
+                clipboard_data["tree"] = self._dir_to_dict(node)
+            else:
+                clipboard_data["content"] = node.read()
+            self.clipboard = clipboard_data
+            if not self.shell.fs.delete(full, self.username, permanent=True):
+                messagebox.showerror("错误", "剪切失败，无法删除源文件")
+                return
+            self._show_notification(f"已剪切: {display_name}")
+
         self.cut_mode = True
-        self._show_notification(f"已剪切: {name}")
+        self._load()
+
+    def _get_vfs_dst_path(self, name):
+        """生成 VFS 目标路径"""
+        if self.path == "/":
+            return "/" + name
+        return self.path + "/" + name
+
+    def _vfs_path_exists(self, path):
+        return self.shell.fs.resolve(path, self.username) is not None
+
+    def _handle_existing(self, dst_path, src_name):
+        """处理目标已存在的情况，返回最终目标路径或 None"""
+        answer = messagebox.askyesnocancel("目标已存在", f"'{src_name}' 已存在，是否覆盖？")
+        if answer is None:
+            return None
+        if answer:
+            self.shell.fs.delete(dst_path, self.username, permanent=True)
+            return dst_path
+        else:
+            base, ext = os.path.splitext(src_name)
+            counter = 1
+            new_name = f"{base} (副本){ext}"
+            while self._vfs_path_exists(self._get_vfs_dst_path(new_name)):
+                counter += 1
+                new_name = f"{base} (副本{counter}){ext}"
+            return self._get_vfs_dst_path(new_name)
+
+    def _handle_existing_host(self, dst_path, src_name):
+        """处理宿主机目标已存在的情况"""
+        answer = messagebox.askyesnocancel("目标已存在", f"'{src_name}' 已存在，是否覆盖？")
+        if answer is None:
+            return None
+        if answer:
+            if os.path.isdir(dst_path):
+                import shutil
+                shutil.rmtree(dst_path)
+            else:
+                os.remove(dst_path)
+            return dst_path
+        else:
+            base, ext = os.path.splitext(src_name)
+            counter = 1
+            new_name = f"{base} (副本){ext}"
+            new_path = os.path.join(self.host_cwd, new_name)
+            while os.path.exists(new_path):
+                counter += 1
+                new_name = f"{base} (副本{counter}){ext}"
+                new_path = os.path.join(self.host_cwd, new_name)
+            return new_path
+
+    def _copy_vfs_dir(self, src_path, dst_path):
+        """递归复制 VFS 目录"""
+        node = self.shell.fs.resolve(src_path, self.username)
+        if not isinstance(node, Directory):
+            return
+        self.shell.fs.mkdir(dst_path, self.username)
+        for child_name, child in node._children.items():
+            child_src = src_path + "/" + child_name if src_path != "/" else "/" + child_name
+            child_dst = dst_path + "/" + child_name if dst_path != "/" else "/" + child_name
+            if isinstance(child, Directory):
+                self._copy_vfs_dir(child_src, child_dst)
+            else:
+                content = child.read()
+                self.shell.fs.create_file(child_dst, content, self.username)
 
     def _paste_here(self):
         if not self.clipboard:
@@ -10899,130 +11327,160 @@ class FileManager(ctk.CTkFrame):
         src_path = self.clipboard.get("path")
         src_name = self.clipboard.get("name")
         is_dir = self.clipboard.get("is_dir", False)
+        tree = self.clipboard.get("tree")
+        content = self.clipboard.get("content")
 
-        # ===== 目标为宿主机 =====
-        if self.mode == "host":
-            dst_dir = self.host_cwd
-            dst_path = os.path.join(dst_dir, src_name)
-            if os.path.exists(dst_path):
-                answer = messagebox.askyesnocancel("目标已存在", f"'{src_name}' 已存在，是否覆盖？")
-                if answer is None:
+        # ===== VFS 模式 =====
+        if self.mode == "vfs":
+            # 源是宿主机 → 复制到 VFS
+            if src_type == "host":
+                dst_path = self._get_vfs_dst_path(src_name)
+                if self._vfs_path_exists(dst_path):
+                    dst_path = self._handle_existing(dst_path, src_name)
+                if not dst_path:
                     return
-                if not answer:
-                    base, ext = os.path.splitext(src_name)
-                    counter = 1
-                    new_name = f"{base} (副本){ext}"
-                    while os.path.exists(os.path.join(dst_dir, new_name)):
-                        counter += 1
-                        new_name = f"{base} (副本{counter}){ext}"
-                    dst_path = os.path.join(dst_dir, new_name)
-
-            try:
-                if src_type == "vfs":
-                    # 从 VFS 复制到宿主机
-                    if is_dir:
-                        # 复制目录
-                        self._copy_vfs_dir_to_host(src_path, dst_path)
-                        self._show_notification(
-                            f"已从 VFS 粘贴目录到宿主机: {os.path.basename(dst_path)}"
-                        )
-                    else:
-                        content = self.shell.fs.read_file(src_path, self.username)
-                        if content is None:
-                            messagebox.showerror("错误", "无法从 VFS 读取文件")
-                            return
-                        with open(dst_path, "w", encoding="utf-8") as f:
-                            f.write(content)
-                        self._show_notification(
-                            f"已从 VFS 粘贴到宿主机: {os.path.basename(dst_path)}"
-                        )
-                else:
-                    # 宿主机到宿主机
-                    import shutil
-
-                    if is_dir:
-                        shutil.copytree(src_path, dst_path)
-                    else:
-                        shutil.copy2(src_path, dst_path)
-                    self._show_notification(f"已粘贴: {os.path.basename(dst_path)}")
-            except Exception as e:
-                messagebox.showerror("错误", f"粘贴失败: {e}")
-                return
-
-            if self.cut_mode and src_type == "host":
                 try:
                     if is_dir:
-                        shutil.rmtree(src_path)
+                        messagebox.showerror("错误", "宿主目录已被剪切，无法复制目录（暂不支持）")
+                        return
                     else:
-                        os.remove(src_path)
-                    self.cut_mode = False
-                    self.clipboard = None
+                        if content is None:
+                            messagebox.showerror("错误", "剪贴板中没有文件内容")
+                            return
+                        self.shell.fs.create_file(dst_path, content, self.username)
+                    self._show_notification(f"已粘贴: {os.path.basename(dst_path)}")
                 except Exception as e:
-                    messagebox.showerror("错误", f"剪切后删除源文件失败: {e}")
-
-            self._load_host(self.host_cwd)
-            return
-
-        # ===== 目标为 VFS =====
-        dst_dir = self.path
-        dst_path = dst_dir + "/" + src_name if dst_dir != "/" else "/" + src_name
-
-        # 处理目标已存在
-        if self.shell.fs.resolve(dst_path, self.username) is not None:
-            answer = messagebox.askyesnocancel("目标已存在", f"'{src_name}' 已存在，是否覆盖？")
-            if answer is None:
+                    messagebox.showerror("错误", f"粘贴失败: {e}")
+                # 不清空剪贴板
+                self._load()
                 return
-            if not answer:
-                base, ext = os.path.splitext(src_name)
-                counter = 1
-                new_name = f"{base} (副本){ext}"
-                while self.shell.fs.resolve(dst_dir + "/" + new_name, self.username) is not None:
-                    counter += 1
-                    new_name = f"{base} (副本{counter}){ext}"
-                dst_path = dst_dir + "/" + new_name if dst_dir != "/" else "/" + new_name
 
-        try:
-            if src_type == "host":
-                if is_dir:
-                    self._copy_host_dir_to_vfs(src_path, dst_path)
-                    self._show_notification(
-                        f"已从宿主机粘贴目录到 VFS: {os.path.basename(dst_path)}"
-                    )
-                else:
-                    # 直接读取二进制并存储到 VFS
-                    with open(src_path, "rb") as f:
-                        raw = f.read()
-                    if self.shell.fs.create_file(dst_path, raw, self.username):
-                        self._show_notification(
-                            f"已从宿主机粘贴到 VFS: {os.path.basename(dst_path)}"
-                        )
+            # 源是 VFS → 复制到 VFS
+            elif src_type == "vfs":
+                dst_path = self._get_vfs_dst_path(src_name)
+                if self._vfs_path_exists(dst_path):
+                    dst_path = self._handle_existing(dst_path, src_name)
+                if not dst_path:
+                    return
+                try:
+                    if is_dir:
+                        if tree is None:
+                            messagebox.showerror("错误", "剪贴板中没有目录树")
+                            return
+                        self._create_dir_from_tree(dst_path, tree)
                     else:
-                        messagebox.showerror("错误", "写入 VFS 失败")
-                        return
-            else:
-                # VFS 到 VFS
-                if is_dir:
-                    if not self.shell.fs.copy(src_path, dst_path, self.username):
-                        messagebox.showerror("错误", "VFS 复制目录失败")
-                        return
-                else:
-                    if not self.shell.fs.copy(src_path, dst_path, self.username):
-                        messagebox.showerror("错误", "VFS 复制文件失败")
-                        return
-                self._show_notification(f"已粘贴: {os.path.basename(dst_path)}")
-        except Exception as e:
-            messagebox.showerror("错误", f"粘贴失败: {e}")
-            return
+                        if content is None:
+                            messagebox.showerror("错误", "剪贴板中没有文件内容")
+                            return
+                        self.shell.fs.create_file(dst_path, content, self.username)
+                    self._show_notification(f"已粘贴: {os.path.basename(dst_path)}")
+                except Exception as e:
+                    messagebox.showerror("错误", f"粘贴失败: {e}")
+                # 不清空剪贴板
+                self._load()
+                return
 
-        # 剪切模式删除 VFS 源
-        if self.cut_mode and src_type == "vfs":
-            if not self.shell.fs.delete(src_path, self.username, permanent=True):
-                messagebox.showerror("错误", "剪切后删除 VFS 源文件失败")
             else:
-                self.cut_mode = False
-                self.clipboard = None
+                messagebox.showerror("错误", "无法识别的剪贴板源")
+                return
 
-        self._load()
+        # ===== Host 模式 =====
+        elif self.mode == "host":
+            # 源是宿主机 → 复制到宿主机
+            if src_type == "host":
+                dst_path = os.path.join(self.host_cwd, src_name)
+                if os.path.exists(dst_path):
+                    dst_path = self._handle_existing_host(dst_path, src_name)
+                if not dst_path:
+                    return
+                try:
+                    if is_dir:
+                        messagebox.showerror("错误", "宿主目录已被剪切，无法复制目录（暂不支持）")
+                        return
+                    else:
+                        if content is None:
+                            messagebox.showerror("错误", "剪贴板中没有文件内容")
+                            return
+                        with open(dst_path, "wb") as f:
+                            f.write(content if isinstance(content, bytes) else content.encode("utf-8"))
+                    self._show_notification(f"已粘贴: {os.path.basename(dst_path)}")
+                except Exception as e:
+                    messagebox.showerror("错误", f"粘贴失败: {e}")
+                # 不清空剪贴板
+                self._load_host(self.host_cwd)
+                return
+
+            # 源是 VFS → 复制到宿主机
+            elif src_type == "vfs":
+                dst_path = os.path.join(self.host_cwd, src_name)
+                if os.path.exists(dst_path):
+                    dst_path = self._handle_existing_host(dst_path, src_name)
+                if not dst_path:
+                    return
+                try:
+                    if is_dir:
+                        if tree is None:
+                            messagebox.showerror("错误", "剪贴板中没有目录树")
+                            return
+                        self._create_dir_from_tree_to_host(dst_path, tree)
+                    else:
+                        if content is None:
+                            messagebox.showerror("错误", "剪贴板中没有文件内容")
+                            return
+                        with open(dst_path, "wb") as f:
+                            f.write(content if isinstance(content, bytes) else content.encode("utf-8"))
+                    self._show_notification(f"已粘贴: {os.path.basename(dst_path)}")
+                except Exception as e:
+                    messagebox.showerror("错误", f"粘贴失败: {e}")
+                # 不清空剪贴板
+                self._load_host(self.host_cwd)
+                return
+
+            else:
+                messagebox.showerror("错误", "无法识别的剪贴板源")
+                return
+
+    def _dir_to_dict(self, node):
+        """将 VFS 目录转换为字典（递归）"""
+        result = {
+            "name": node.name,
+            "type": "dir",
+            "children": []
+        }
+        for child_name, child in node._children.items():
+            if isinstance(child, Directory):
+                result["children"].append(self._dir_to_dict(child))
+            else:
+                result["children"].append({
+                    "name": child.name,
+                    "type": "file",
+                    "content": child.read()  # bytes
+                })
+        return result
+
+    def _create_dir_from_tree(self, dst_path, tree):
+        """从字典恢复 VFS 目录"""
+        if not self.shell.fs.mkdir(dst_path, self.username):
+            raise Exception("创建目录失败")
+        for item in tree.get("children", []):
+            child_path = dst_path + "/" + item["name"] if dst_path != "/" else "/" + item["name"]
+            if item["type"] == "dir":
+                self._create_dir_from_tree(child_path, item)
+            else:
+                self.shell.fs.create_file(child_path, item.get("content", b""), self.username)
+
+    def _create_dir_from_tree_to_host(self, dst_path, tree):
+        """从字典恢复宿主机目录"""
+        import os
+        os.makedirs(dst_path, exist_ok=True)
+        for item in tree.get("children", []):
+            child_path = os.path.join(dst_path, item["name"])
+            if item["type"] == "dir":
+                self._create_dir_from_tree_to_host(child_path, item)
+            else:
+                content = item.get("content", b"")
+                with open(child_path, "wb") as f:
+                    f.write(content)
 
     def _copy_vfs_dir_to_host(self, src_dir, dst_dir):
         """递归复制 VFS 目录到宿主机"""
@@ -11034,7 +11492,7 @@ class FileManager(ctk.CTkFrame):
         if node is None or not isinstance(node, Directory):
             raise Exception(f"VFS 目录不存在: {src_dir}")
 
-        for name, child in node.children.items():
+        for name, child in node._children.items():
             src_path = src_dir + "/" + name if src_dir != "/" else "/" + name
             dst_path = os.path.join(dst_dir, name)
             if isinstance(child, Directory):
@@ -11496,7 +11954,7 @@ class FileManager(ctk.CTkFrame):
                 if total_files % 100 == 0:
                     self.gui._print(f"已扫描 {total_files} 个文件，发现 {threat_count} 个威胁\n")
             elif isinstance(node, Directory):
-                for child in node.children.values():
+                for child in node._children.values():
                     child_path = (
                         current_path + "/" + child.name if current_path != "/" else "/" + child.name
                     )
@@ -12466,34 +12924,113 @@ class UnifiedAIEngine:
             "如果用户只是普通对话，直接正常回答，不要添加工具 JSON。\n"
         )
 
+        self._model_user_choice = None
+
+        # 弹窗父窗口（由AI聊天窗口设置）
+        self._popup_parent = None
+
         self.detect_local_ollama()
 
     # ---------- 模型检测 ----------
     def detect_local_ollama(self):
-        """检测本机 Ollama 服务，若存在则自动使用"""
-        try:
-            import urllib.request
-            req = urllib.request.urlopen("http://localhost:11434/api/tags", timeout=1)
-            data = json.loads(req.read())
-            self.available_models = [m["name"] for m in data.get("models", [])]
-            if self.available_models:
-                self.provider = "ollama"
-                self.model = self.available_models[0]
-                return True
-        except Exception:
-            pass
+        """检测本机 Ollama 服务（尝试 localhost 和 127.0.0.1）"""
+        import urllib.request
+        for host in ("127.0.0.1", "localhost"):
+            try:
+                url = f"http://{host}:11434/api/tags"
+                req = urllib.request.urlopen(url, timeout=2)
+                data = json.loads(req.read())
+                self.available_models = [m["name"] for m in data.get("models", [])]
+                if self.available_models:
+                    return True
+            except Exception:
+                continue
         self.available_models = []
-        self.provider = None
-        self.model = None
         return False
 
     def get_status(self):
-        if self.provider == "ollama":
-            return "已就绪（本地免费）", self.model
+        if self._model_user_choice is False:
+            return "离线模式", None
         elif self.provider:
-            return f"已配置（{self.provider}）", self.model
+            if self.provider == "ollama":
+                return "在线（Ollama）", self.model
+            else:
+                return f"在线（{self.provider}）", self.model
+        elif self.available_models:
+            return "发现本地模型（待确认）", self.available_models[0]
         else:
             return "未就绪", None
+    # ---------- 配套补丁包 ----------
+    def _try_enable_model_sync(self):
+        """尝试启用在线模型，返回True表示使用在线，False表示离线（必须在主线程调用）"""
+        if self._model_user_choice is not None:
+            return self._model_user_choice
+
+        conf_provider = self.shell.config.get("ai.provider", "mock")
+        api_key = self.shell.config.get("ai.api_key", "")
+        if conf_provider not in ("mock", "") and api_key:
+            self.provider = conf_provider
+            self.model = self.shell.config.get("ai.model", "gpt-3.5-turbo")
+            self._model_user_choice = True
+            return True
+
+        if self.available_models:
+            if hasattr(self.shell, "gui_app") and self.shell.gui_app and self.shell.gui_app.winfo_exists():
+                from tkinter import messagebox
+                parent_win = self._popup_parent if self._popup_parent and self._popup_parent.winfo_exists() else self.shell.gui_app
+                resp = messagebox.askyesno(
+                    "发现本地 AI 引擎",
+                    f"检测到本地 Ollama 模型：{self.available_models[0]}\n\n是否启用在线 AI？\n选择“否”将使用离线模式。",
+                    parent=parent_win
+                )
+                if resp:
+                    self.provider = "ollama"
+                    self.model = self.available_models[0]
+                    self._model_user_choice = True
+                    return True
+                else:
+                    # 用户选择离线，清除所有在线状态
+                    self.provider = None
+                    self.model = None
+                    self._model_user_choice = False
+                    return False
+            else:
+                print(f"检测到本地 Ollama 模型 {self.available_models[0]}，但当前非 GUI 环境，默认使用离线模式。")
+                self._model_user_choice = False
+                return False
+
+        self._model_user_choice = False
+        return False
+
+    def ask_sync(self, user_text):
+        """同步获取 AI 回复（用于命令行），自动处理在线/离线"""
+        # 确保模型选择已完成（如果还没选择，尝试询问）
+        if self._model_user_choice is None:
+            # 注意：这里不能直接弹窗（因为可能在后台线程），所以我们只尝试在线配置或离线
+            # 但对于 ai 命令，它本身在主线程执行，所以可以直接调用 _try_enable_model_sync
+            pass
+
+        # 如果已经启用在线模型，则使用在线
+        if self.provider is not None:
+            messages = [{"role": "user", "content": user_text}]
+            if self.provider == "ollama":
+                reply = self._query_ollama(self.model, messages)
+            else:
+                reply = self._query_litellm(self.provider, self.model, messages)
+            # 提取思考并显示
+            thinking = self.extract_thinking(reply)
+            if thinking:
+                print(f"🧠 思考: {thinking}")
+                reply = self.remove_thinking(reply)
+            # 解析工具调用并执行
+            actions = self.parse_tool_calls(reply)
+            if actions:
+                self.shell._execute_ai_actions(actions)
+                reply = "✅ 已根据您的指令完成操作。"
+            return reply, "🤖"
+        else:
+            # 离线模式
+            return self._offline_reply(user_text)
 
     # ---------- 对话入口 ----------
     def chat(self, user_input):
@@ -12662,7 +13199,8 @@ class UnifiedAIEngine:
             else:
                 return f"Ollama 返回错误: {r.status_code}"
         except ImportError:
-            import urllib.request, socket
+            import urllib.request
+            import socket
             payload = {
                 "model": model,
                 "messages": [{"role": "system", "content": self.system_prompt}] + messages,
@@ -12715,37 +13253,62 @@ class UnifiedAIEngine:
         return reply, "🤖"
 
     def _quick_check_ollama(self):
-        """1秒超时探测本地 Ollama 是否运行"""
         import socket
-        try:
-            s = socket.create_connection(("localhost", 11434), timeout=1)
-            s.close()
-            return True
-        except Exception:
-            return False
+        for host in ("127.0.0.1", "localhost"):
+            try:
+                s = socket.create_connection((host, 11434), timeout=1)
+                s.close()
+                return True
+            except Exception:
+                continue
+        return False
 
     # ---------- 语音合成 ----------
     def speak(self, text):
         if not HAS_EDGE_TTS or not HAS_PYGAME:
             return
-        import asyncio, tempfile, pygame
+        import asyncio
         threading.Thread(target=asyncio.run, args=(self._async_speak(text),), daemon=True).start()
 
     async def _async_speak(self, text):
-        import tempfile, asyncio, pygame
+        import tempfile
+        import pygame
         import edge_tts
+
+        # 创建临时文件
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        communicate = edge_tts.Communicate(text, "zh-CN-XiaoxiaoNeural")
-        await communicate.save(tmp.name)
-        pygame.mixer.init()
-        pygame.mixer.music.load(tmp.name)
-        pygame.mixer.music.play()
-        while pygame.mixer.music.get_busy():
-            time.sleep(0.1)
+        tmp_path = tmp.name
+        tmp.close()  # 先关闭，避免文件被占用
+
         try:
-            os.unlink(tmp.name)
-        except:
-            pass
+            # 使用 edge-tts 生成语音文件
+            communicate = edge_tts.Communicate(text, "zh-CN-XiaoxiaoNeural")
+            await communicate.save(tmp_path)
+
+            # 检查文件是否真的生成成功
+            if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                raise Exception("语音文件生成失败")
+
+            # 初始化 pygame mixer（如果尚未初始化）
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+
+            # 播放
+            pygame.mixer.music.load(tmp_path)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.1)
+
+        except Exception as e:
+            # 播放失败，打印错误但不会中断主程序
+            print(f"语音合成失败: {e}")
+
+        finally:
+            # 无论成功与否，确保删除临时文件
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
 
     def clear_history(self):
         self.messages = []
@@ -12759,7 +13322,6 @@ class UnifiedAIEngine:
         """
         import datetime
         import difflib
-        import math
         import random
         import re
         import traceback
@@ -13741,6 +14303,14 @@ class KIKIShell:
         "__import__": __import__,
         # 不含危险函数
     }
+    SAFE_MODULES = {
+        "math", "random", "time", "datetime", "json", "re", "string",
+        "itertools", "functools", "collections", "copy", "textwrap",
+        "unicodedata", "difflib", "heapq", "bisect", "array", "struct",
+        "enum", "dataclasses", "typing", "abc", "queue",
+        "io", "pathlib", "hashlib", "hmac", "base64", "decimal",
+        "fractions", "statistics", "platform", "sys", "subprocess"
+    }
 
     # ===== 新增：长期记忆管理器（嵌套类） =====
     class LongTermMemory:
@@ -13836,13 +14406,24 @@ class KIKIShell:
         import types
 
         self._command_registry = {}
-        self._command_registry = types.MappingProxyType(self._command_registry)
+        self.COMMANDS = types.MappingProxyType(self._command_registry)
         self.parent_shell = parent_shell
         self.hw = Hardware()
         self.fs = VirtualFS()
         self.config = Config(self.fs, self)
         # ===== 加载持久化数据（必须放在 config 初始化之后） =====
         self.installed_apps = []
+        try:
+            self.installed_apps = self.config.get("installed_apps", [])
+        except:
+            pass
+        if not self.installed_apps:
+            try:
+                content = self.fs.read_file("/home/admin/.kiki_installed_apps", "admin")
+                if content:
+                    self.installed_apps = json.loads(content)
+            except:
+                pass
         init_db()
         state = load_state()
         if state and state.get("fs"):
@@ -13908,6 +14489,7 @@ class KIKIShell:
         self.chat = ChatManager(shell=self)
         self.ai_engine = UnifiedAIEngine(self)
         self._register_commands()
+        self._load_third_party_apps()
         if "cls" in self._command_registry and "clear" not in self._command_registry:
             self._command_registry["clear"] = self._command_registry["cls"]
         self.pipe_supported = {
@@ -14008,6 +14590,23 @@ class KIKIShell:
             self.ai_worker.join(timeout=2)
             if self.ai_worker.is_alive():
                 self.ai_worker.terminate()
+
+    def _collect_imports_from_code(self, code):
+        """使用 ast 解析代码中的 import 语句，返回模块名列表"""
+        import ast
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return []
+        modules = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    modules.add(alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    modules.add(node.module.split(".")[0])
+        return list(modules)
 
     @command("compress", "files", "压缩虚拟文件系统 (VFS) 中的文件或目录")
     def compress_cmd(self, args, src=None):
@@ -14304,7 +14903,7 @@ class KIKIShell:
             target=_safe_exec_sandbox_target, args=(code, output_queue, file_path)
         )
         p.start()
-        p.join(timeout=10)
+        p.join(timeout=60)
 
         output = ""
         error = ""
@@ -14992,19 +15591,56 @@ Commands:
             print("仅 GUI 模式下可用")
 
     def _load_third_party_apps(self):
-        """加载已安装的第三方应用（只加载用户安装的）"""
+        """加载已安装的第三方应用"""
         repo = self._load_repo()
         for app_name in self.installed_apps:
-            if app_name in repo and app_name not in self.COMMANDS:
+            if app_name in repo and app_name not in self._command_registry:
                 self._install_app(app_name, {app_name: repo[app_name]})
                 print(f"[自动加载] 已恢复第三方命令: {app_name}")
 
-    @command("pin", "system", "固定命令到任务栏")
+    @command("pin", "system", "固定命令或窗口到任务栏")
     def pin_cmd(self, args, src=None):
         if not args:
-            print("用法: pin <命令名>")
+            print("用法: pin <命令名 或 窗口类型>")
+            print("窗口类型支持: terminal, browser, calc, settings, ai, filemanager, editor")
             return
-        cmd = args.strip().split()[0]
+        cmd = args.strip().split()[0].lower()
+
+        # 窗口类型映射
+        window_types = {
+            "terminal": ("terminal", None),
+            "browser": ("webbrowser", None),
+            "calc": ("calculator", None),
+            "calculator": ("calculator", None),
+            "settings": ("settings", None),
+            "ai": ("aichat", None),
+            "filemanager": ("filemanager", "/"),
+            "files": ("filemanager", "/"),
+            "editor": ("texteditor", None),
+            "paint": ("paint", None),
+            "lisp": ("lisp", None),
+            "python": ("python", None),
+            "monitor": ("systemmonitor", None),
+            "sysmon": ("systemmonitor", None),
+        }
+
+        if cmd in window_types:
+            win_type, data = window_types[cmd]
+            if hasattr(self, "gui_app") and self.gui_app:
+                pinned = self.gui_app.pinned_items
+                key = (win_type, data)
+                if key not in pinned:
+                    pinned.append(key)
+                    self.gui_app._save_pinned_items()
+                    self.gui_app._update_dock()
+                    print(f"✅ 已固定窗口 '{cmd}' 到任务栏")
+                else:
+                    print(f"窗口 '{cmd}' 已固定在任务栏")
+            else:
+                print("仅 GUI 模式下可用")
+            return
+
+        # 普通命令固定
         if cmd not in self.COMMANDS:
             print(f"命令 '{cmd}' 不存在")
             return
@@ -15015,9 +15651,9 @@ Commands:
                 pinned.append(key)
                 self.gui_app._save_pinned_items()
                 self.gui_app._update_dock()
-                print(f"✅ 已固定 '{cmd}' 到任务栏")
+                print(f"✅ 已固定命令 '{cmd}' 到任务栏")
             else:
-                print(f"'{cmd}' 已固定在任务栏")
+                print(f"命令 '{cmd}' 已固定在任务栏")
         else:
             print("仅 GUI 模式下可用")
 
@@ -15295,9 +15931,12 @@ Commands:
         return self.config.get("installed_apps", [])
 
     def _save_installed_apps(self):
-        """保存已安装应用列表到用户配置"""
         self.config.set("installed_apps", self.installed_apps, self.username)
         self.config.save_user_config(self.username)
+        try:
+            self.fs.write_file("/home/admin/.kiki_installed_apps", json.dumps(self.installed_apps), "admin")
+        except:
+            pass
 
     @command("sched", "system", "进程调度命令")
     def sched_cmd(self, args, src=None):
@@ -16016,13 +16655,31 @@ Commands:
         sub = parts[0].lower()
         pm = self.gui_app.plugin_manager
         if sub == "list":
-            plugins = pm.list_plugins()
-            if not plugins:
-                print("没有加载任何插件")
+            pm = self.gui_app.plugin_manager
+            # 显示已加载插件
+            loaded = pm.list_plugins()
+            print("已加载插件:")
+            if loaded:
+                for name, ver in loaded:
+                    print(f"  ✅ {name} v{ver}")
             else:
-                print("已加载的插件:")
-                for name, ver in plugins:
-                    print(f"  {name} v{ver}")
+                print("  (无)")
+
+            # 显示全部插件（扫描 plugins_dir 下的 .py 文件）
+            import os
+            all_plugins = []
+            if os.path.isdir(pm.plugins_dir):
+                for f in os.listdir(pm.plugins_dir):
+                    if f.endswith(".py") and not f.startswith("_"):
+                        all_plugins.append(f[:-3])
+            print("全部可用插件:")
+            if all_plugins:
+                for name in all_plugins:
+                    loaded_names = [n for n, _ in loaded]
+                    status = "✅ 已加载" if name in loaded_names else "📦 未加载"
+                    print(f"  {status} {name}")
+            else:
+                print("  (无)")
         elif sub == "load":
             if len(parts) < 2:
                 print("请指定插件名")
@@ -16054,21 +16711,18 @@ plugin_info = {{
     'author': 'Your Name',
 }}
 
+def {name}_cmd(args):
+    print(f'Hello from {name} plugin!')
+
 def register(api):
     """注册插件功能"""
-    # 示例：注册一个命令
-    def {name}_cmd(args):
-        print(f'Hello from {name} plugin!')
     api.register_command('{name}', {name}_cmd, help_text='Plugin command')
-    # 添加菜单项
     api.add_menu_item('工具', '🔌 {name}', lambda: print('Menu clicked from {name}'))
-    
-    # 还可以做更多事情：
-    # - 注册窗口类 (api.register_window(...))
-    # - 添加文件系统钩子 (api.add_fs_hook(...))
 '''
-        os.makedirs("plugins", exist_ok=True)
-        path = os.path.join("plugins", name + ".py")
+        # 改为保存到 KIKI_DATA_DIR/plugins 目录下
+        plugins_dir = os.path.join(KIKI_DATA_DIR, "plugins")
+        os.makedirs(plugins_dir, exist_ok=True)
+        path = os.path.join(plugins_dir, name + ".py")
         with open(path, "w", encoding="utf-8") as f:
             f.write(template)
         print(f"✅ 插件模板已创建: {path}")
@@ -16280,11 +16934,21 @@ def register(api):
             new = self.fs.resolve(home, self.username)
         else:
             new = self.fs.resolve(args, self.username)
-        if isinstance(new, Directory) and self.fs.check_permission(self.username, new, "x"):
+        if new is None:
+            # 路径不存在
+            # 如果用户输入的是文件名，提示使用 open/type
+            cwd = self.fs.get_abs_path(self.fs.cwd)
+            full = f"{cwd}/{args}" if cwd != "/" else f"/{args}"
+            node = self.fs.resolve(full, self.username)
+            if node and isinstance(node, File):
+                print(f"'{args}' 是一个文件，请使用 'open {args}' 或 'type {args}' 来打开它。")
+            else:
+                print(_("dir_not_found"))
+        elif isinstance(new, Directory) and self.fs.check_permission(self.username, new, "x"):
             self.fs.cwd = new
         else:
-            if new is None:
-                print(_("dir_not_found"))
+            if isinstance(new, File):
+                print(f"'{args}' 是一个文件，请使用 'open {args}' 或 'type {args}' 来打开它。")
             else:
                 print(_("permission_denied"))
 
@@ -16315,14 +16979,14 @@ def register(api):
         if not isinstance(obj, Directory):
             print(_("not_a_directory"))
             return
-        if len(obj.children) != 0:
+        if len(obj._children) != 0:
             print(_("directory_not_empty"))
             return
         parent = obj.parent
         if not parent or not self.fs.check_permission(self.username, parent, "w"):
             print(_("permission_denied"))
             return
-        del parent.children[obj.name]
+        del parent._children[obj.name]
         self.fs._invalidate_cache(path)
         print(_("dir_removed"))
         if hasattr(self, "gui_app") and self.gui_app:
@@ -16754,151 +17418,6 @@ def register(api):
             else:
                 self.running = False
 
-    @command("deluser", "user", "删除当前用户账户并强制重新登录")
-    def deluser_cmd(self, args, src=None):
-        if not args:
-            print("用法: deluser <用户名>")
-            self._finalize_prompt()
-            return
-        target = args.strip().lower()
-
-        # 只能删除自己
-        if target != self.username:
-            print("❌ 只能删除当前登录的用户")
-            self._finalize_prompt()
-            return
-
-        # 禁止删除保留用户
-        if target in self.RESERVED_USERNAMES:
-            print(f"❌ 不能删除保留用户: {target}")
-            self._finalize_prompt()
-            return
-
-        with self._lock:
-            if target not in self.users:
-                print(f"❌ 用户 '{target}' 不存在")
-                self._finalize_prompt()
-                return
-
-            # 确认删除
-            if hasattr(self, "gui_app") and self.gui_app and self.gui_app.winfo_exists():
-                from tkinter import messagebox
-
-                if not messagebox.askyesno(
-                    "删除用户",
-                    f"确定要删除用户 '{target}' 及其所有数据吗？\n此操作不可逆！",
-                    icon="warning",
-                ):
-                    print("删除已取消")
-                    self._finalize_prompt()
-                    return
-            else:
-                ans = input(f"⚠️ 确定要删除用户 '{target}' 及其所有数据吗？(y/n): ").strip().lower()
-                if ans != "y":
-                    print("删除已取消")
-                    self._finalize_prompt()
-                    return
-
-            # 删除家目录
-            home_dir = f"/home/{target}"
-            home_node = self.fs.resolve(home_dir, "root")
-            if home_node and isinstance(home_node, Directory):
-                self.fs.delete(home_dir, "root", permanent=True)
-                print(f"✅ 已删除用户家目录: {home_dir}")
-            else:
-                print(f"⚠️ 用户家目录不存在或不是目录: {home_dir}")
-
-            # 从用户字典移除
-            del self.users[target]
-            self._save_users()
-            self.fs._audit(f"DELUSER {target}", self.username)
-            print(f"✅ 用户 '{target}' 已删除，即将退出登录...")
-
-        # 强制注销
-        if hasattr(self, "gui_app") and self.gui_app and self.gui_app.winfo_exists():
-            try:
-                self.gui_app._logout()
-            except Exception as e:
-                print(f"⚠️ 注销过程出现异常: {e}")
-                self.gui_app.destroy()
-                import os
-                import sys
-
-                python = sys.executable
-                os.execl(python, python, *sys.argv)
-        else:
-            self.running = False
-            print("请重新登录。")
-
-    @command("force_deluser", "admin", "强制删除任意用户（仅限管理员，不能删除 root）")
-    def force_deluser_cmd(self, args, src=None):
-        if not args:
-            print("用法: force_deluser <用户名>")
-            self._finalize_prompt()
-            return
-        target = args.strip().lower()
-
-        if not self._is_admin():
-            print("❌ 只有管理员可以使用此命令")
-            self._finalize_prompt()
-            return
-
-        if target == "root":
-            print("❌ 不能删除 root 超级管理员")
-            self._finalize_prompt()
-            return
-
-        if target not in self.users:
-            print(f"❌ 用户 '{target}' 不存在")
-            self._finalize_prompt()
-            return
-
-        if hasattr(self, "gui_app") and self.gui_app and self.gui_app.winfo_exists():
-            from tkinter import messagebox
-
-            if not messagebox.askyesno(
-                "强制删除用户", f"确定要强制删除用户 '{target}' 吗？", icon="warning"
-            ):
-                print("取消操作")
-                self._finalize_prompt()
-                return
-        else:
-            ans = input(f"⚠️ 确定要强制删除用户 '{target}' 吗？(y/n): ").strip().lower()
-            if ans != "y":
-                print("取消操作")
-                self._finalize_prompt()
-                return
-
-        home_dir = f"/home/{target}"
-        home_node = self.fs.resolve(home_dir, "root")
-        if home_node and isinstance(home_node, Directory):
-            self.fs.delete(home_dir, "root", permanent=True)
-            print(f"✅ 已删除用户家目录: {home_dir}")
-        else:
-            print(f"⚠️ 用户家目录不存在或不是目录: {home_dir}")
-
-        with self._lock:
-            del self.users[target]
-        self._save_users()
-        self.fs._audit(f"FORCE_DELUSER {target}", self.username)
-        print(f"✅ 用户 '{target}' 已强制删除！")
-        self._finalize_prompt()
-
-        if target == self.username:
-            print("⚠️ 你已删除自己，即将退出登录...")
-            if hasattr(self, "gui_app") and self.gui_app and self.gui_app.winfo_exists():
-                try:
-                    self.gui_app._logout()
-                except Exception:
-                    self.gui_app.destroy()
-                    import os
-                    import sys
-
-                    python = sys.executable
-                    os.execl(python, python, *sys.argv)
-            else:
-                self.running = False
-
     @command("passwd", "user", "cmd_passwd")
     def passwd(self, args, src=None):
         if not self.username:
@@ -17088,8 +17607,8 @@ def register(api):
             path_parts = home.split("/")[1:]
             temp = self.fs.cwd
             for part in path_parts:
-                if part in temp.children:
-                    temp = temp.children[part]
+                if part in temp._children:
+                    temp = temp._children[part]
                 else:
                     break
             if isinstance(temp, Directory):
@@ -17147,7 +17666,7 @@ def register(api):
                 if isinstance(node, File):
                     total_files += 1
                 elif isinstance(node, Directory):
-                    for child in node.children.values():
+                    for child in node._children.values():
                         count_files(child)
 
             count_files(src_obj)
@@ -17159,7 +17678,7 @@ def register(api):
 
                     def copy_with_progress(src_node, dst_parent, dst_name):
                         if isinstance(src_node, File):
-                            if dst_name in dst_parent.children and not interactive:
+                            if dst_name in dst_parent._children and not interactive:
                                 if (
                                     hasattr(self, "gui_app")
                                     and self.gui_app
@@ -17177,7 +17696,7 @@ def register(api):
                                     if input().strip().lower() != "y":
                                         pbar.update(1)
                                         return
-                            dst_parent.children[dst_name] = File(
+                            dst_parent._children[dst_name] = File(
                                 dst_name,
                                 dst_parent,
                                 src_node.content,
@@ -17187,8 +17706,8 @@ def register(api):
                             pbar.update(1)
                         elif isinstance(src_node, Directory):
                             new_dir = Directory(dst_name, dst_parent, self.username, src_node.mode)
-                            dst_parent.children[dst_name] = new_dir
-                            for child in src_node.children.values():
+                            dst_parent._children[dst_name] = new_dir
+                            for child in src_node._children.values():
                                 copy_with_progress(child, new_dir, child.name)
 
                     dst_parent = self.fs.resolve(os.path.dirname(dst_path), self.username)
@@ -17260,7 +17779,7 @@ def register(api):
             nonlocal total
             total += 1
             if isinstance(node, Directory):
-                for child in node.children.values():
+                for child in node._children.values():
                     count_nodes(child)
 
         count_nodes(start)
@@ -17276,7 +17795,7 @@ def register(api):
                         )
                     pbar.update(1)
                     if isinstance(node, Directory):
-                        for child in node.children.values():
+                        for child in node._children.values():
                             search(
                                 child,
                                 (current_path + "/" + node.name if current_path else node.name),
@@ -17336,7 +17855,7 @@ def register(api):
                 if isinstance(node, File):
                     total_files += 1
                 elif isinstance(node, Directory):
-                    for child in node.children.values():
+                    for child in node._children.values():
                         count_files(child)
 
             count_files(obj)
@@ -17369,7 +17888,7 @@ def register(api):
                                             )
                             pbar.update(1)
                         elif isinstance(node, Directory):
-                            for child in node.children.values():
+                            for child in node._children.values():
                                 new_path = (
                                     f"{path_prefix}/{child.name}" if path_prefix else child.name
                                 )
@@ -19217,7 +19736,7 @@ def register(api):
                 return
             visited.add(node_id)
             if isinstance(node, Directory):
-                for name, child in node.children.items():
+                for name, child in node._children.items():
                     child_path = f"{path}/{name}" if path else name
                     check_node(child, child_path)
             else:
@@ -20150,7 +20669,11 @@ def register(api):
         # ===== 普通 AI 对话 =====
         else:
             full_text = " ".join(parts)
-            reply, emoji = self._local_ai_reply(full_text)
+            # 确保模型选择（弹窗询问）
+            if self.ai_engine._model_user_choice is None:
+                self.ai_engine._try_enable_model_sync()
+            # 获取同步回复（在线或离线）
+            reply, emoji = self.ai_engine.ask_sync(full_text)
             print(reply)
 
     @command("memory", "system", "长期记忆管理 (add/search/remove/list)")
@@ -20246,12 +20769,6 @@ def register(api):
     def _execute_open_calc(self):
         if hasattr(self, "gui_app") and self.gui_app:
             self.gui_app._open_calc()
-            return True
-        return False
-
-    def _execute_screenshot(self):
-        if hasattr(self, "gui_app") and self.gui_app:
-            self.gui_app._screenshot_full()
             return True
         return False
 
@@ -20573,7 +21090,7 @@ def register(api):
                 elif isinstance(node, Directory):
 
                     def add_dir_to_zip(current_node, current_path):
-                        for name, child in current_node.children.items():
+                        for name, child in current_node._children.items():
                             child_vfs_path = current_path + "/" + name
                             if isinstance(child, File):
                                 zf.writestr(child_vfs_path, child.read())
@@ -20766,7 +21283,7 @@ def register(api):
                 # 去掉用户名部分（此时 parts[0] 可能是用户名）
                 if parts and parts[0] == user:
                     parts = parts[1:]
-                # 重建为 /home/user/... 
+                # 重建为 /home/user/...
                 return "/home/" + user + ("/" + "/".join(parts) if parts else "")
             # 如果包含 "desktop" 或 "桌面"，映射到用户桌面
             if "desktop" in path.lower() or "桌面" in path:
@@ -21003,10 +21520,72 @@ def register(api):
         # ===== 新增：拦截 -c 参数，重定向到沙盒 =====
         if args and args.strip().startswith("-c"):
             code_part = args.strip()[2:].strip()
-            # 去除可能的外层引号
-            if code_part.startswith('"') and code_part.endswith('"') or code_part.startswith("'") and code_part.endswith("'"):
+            if (code_part.startswith('"') and code_part.endswith('"')) or (code_part.startswith("'") and code_part.endswith("'")):
                 code_part = code_part[1:-1]
-            self._safe_exec_python(code_part)
+            # 解析代码中的导入，弹窗确认（原有逻辑）
+            imports = self._collect_imports_from_code(code_part)
+            allowed = []
+            for mod in imports:
+                if mod in ("os", "subprocess", "builtins", "ctypes", "socket",
+                           "select", "signal", "multiprocessing", "threading",
+                           "pty", "tty", "termios", "winreg"):
+                    continue
+                if mod in self.SAFE_MODULES:
+                    allowed.append(mod)
+                else:
+                    if self._confirm_import(mod):
+                        allowed.append(mod)
+            # ===== 复制当前 VFS 目录到临时目录 =====
+            import tempfile
+            import shutil
+            vfs_cwd = self.fs.get_abs_path(self.fs.cwd)
+            temp_cwd = tempfile.mkdtemp(prefix="kiki_sandbox_")
+            # 复制 VFS 当前目录下的所有文件（简单遍历）
+            items = self.fs.listdir(vfs_cwd, self.username) or []
+            for name in items:
+                node = self.fs.resolve(vfs_cwd + "/" + name if vfs_cwd != "/" else "/" + name, self.username)
+                if node and isinstance(node, File):
+                    content = node.read()
+                    with open(os.path.join(temp_cwd, name), "wb") as f:
+                        f.write(content)
+                elif node and isinstance(node, Directory):
+                    # 暂不复制子目录，如有需要可递归
+                    pass
+            # ==================================
+            import multiprocessing
+            output_queue = multiprocessing.Queue()
+            p = multiprocessing.Process(
+                target=_safe_exec_sandbox_target,
+                args=(code_part, output_queue, None, allowed, temp_cwd),
+            )
+            p.start()
+            p.join(timeout=60)
+            output = ""
+            error = ""
+            if not output_queue.empty():
+                msg = output_queue.get()
+                if msg[0] == "result":
+                    output, error = msg[1], msg[2]
+                elif msg[0] == "exception":
+                    error = msg[1]
+            if p.is_alive():
+                p.terminate()
+                p.join()
+                error += "\n⚠️ 沙盒执行超时，已被强制终止。"
+            # 清理临时目录
+            import shutil
+            shutil.rmtree(temp_cwd, ignore_errors=True)
+            # 输出结果
+            if output:
+                if self.gui_app:
+                    self.gui_app._print(output)
+                else:
+                    print(output, end="")
+            if error:
+                if self.gui_app:
+                    self.gui_app._print(error)
+                else:
+                    print(error, end="")
             return
         # =============================================
 
@@ -21256,7 +21835,7 @@ def register(api):
         vfs_apps_path = "/home/admin/apps"
         vfs_apps_node = self.fs.resolve(vfs_apps_path, self.username)
         if vfs_apps_node and isinstance(vfs_apps_node, Directory):
-            for folder_name in vfs_apps_node.children:
+            for folder_name in vfs_apps_node._children:
                 folder_path = vfs_apps_path + "/" + folder_name
                 # 检查是否包含 kiki.json 和 main.py（或与文件夹同名的 .py）
                 json_node = self.fs.resolve(folder_path + "/kiki.json", self.username)
@@ -21304,11 +21883,20 @@ def register(api):
             if not repo:
                 print("没有可用的应用。")
                 return
-            print("可用应用:")
-            for app, info in repo.items():
-                deps = info.get("deps", [])
-                dep_str = f" (依赖: {', '.join(deps)})" if deps else ""
-                print(f"  {app} v{info.get('version', '1.0')}{dep_str}")
+            print("已安装应用:")
+            installed = self.installed_apps if hasattr(self, "installed_apps") else []
+            if installed:
+                for app in installed:
+                    if app in repo:
+                        print(f"  ✅ {app} v{repo[app].get('version', '1.0')}")
+                    else:
+                        print(f"  ✅ {app} (未知版本)")
+            else:
+                print("  (无)")
+            print("全部可用应用:")
+            for app in repo:
+                status = "✅ 已安装" if app in installed else "📦 可安装"
+                print(f"  {status} {app} v{repo[app].get('version', '1.0')}")
             return
 
         elif subcmd == "pack":
@@ -21430,53 +22018,30 @@ def register(api):
         info = repo[app]
         script = info.get("script", "")
 
-        # 将脚本内容写入 VFS 的一个临时文件（只是为了保留，但我们会读取内容）
         script_path = f"/home/{self.username}/.kiki_apps/{app}.py"
         if not self.fs.resolve(f"/home/{self.username}/.kiki_apps", self.username):
             self.fs.mkdir(f"/home/{self.username}/.kiki_apps", self.username)
         self.fs.create_file(script_path, script, self.username)
 
-        # 读取脚本内容（在父进程中完成）
         script_content = self.fs.read_file(script_path, self.username)
 
         def run_app(args=None, src=None):
-            import multiprocessing
-
-            output_queue = multiprocessing.Queue()
-            p = multiprocessing.Process(
-                target=_app_sandbox_target,
-                args=(script_content, args or "", output_queue),
-            )
-            p.start()
-            p.join(timeout=10)
-            output = ""
-            error = ""
-            if not output_queue.empty():
-                msg = output_queue.get()
-                if msg[0] == "result":
-                    output = msg[1]
-                    error = msg[2]
-                elif msg[0] == "exception":
-                    error = msg[1]
-            if p.is_alive():
-                p.terminate()
-                p.join()
-                error += "\n⚠️ 应用执行超时，已强制终止。"
-            if output:
+            output, error = _run_app_script(script_content, args or "")
+            if error:
+                if self.gui_app:
+                    self.gui_app._print(f"❌ {error}\n")
+                else:
+                    print(f"❌ {error}")
+            elif output:
                 if self.gui_app:
                     self.gui_app._print(output)
                 else:
                     print(output)
-            if error:
-                if self.gui_app:
-                    self.gui_app._print(error)
-                else:
-                    print(error)
 
         self._command_registry[app] = (run_app, f"从 {app} 安装的应用", "misc")
-        if app not in self.installed_apps:
-            self.installed_apps.append(app)
-            self._save_installed_apps()
+        self.installed_apps.append(app)
+        self._save_installed_apps()
+        self.COMMANDS = types.MappingProxyType(self._command_registry)
         print(f"✅ 应用 {app} 已安装，命令已注册。")
 
     # ==================== KPK 包格式支持 ====================
@@ -21500,7 +22065,7 @@ def register(api):
             base = package_path.rstrip("/")
 
             def collect_vfs(dir_node, current_path):
-                for name, child in dir_node.children.items():
+                for name, child in dir_node._children.items():
                     full_path = current_path + "/" + name
                     if isinstance(child, File):
                         rel_path = full_path[len(base) + 1 :]  # 相对路径
@@ -21731,7 +22296,7 @@ def register(api):
                     print(f"  ❌ 加密异常: {e}")
                     failed_count += 1
             elif isinstance(n, Directory) and recursive:
-                for child in n.children.values():
+                for child in n._children.values():
                     child_path = current_path + "/" + child.name
                     encrypt_node(child, child_path)
             else:
@@ -21819,7 +22384,7 @@ def register(api):
                 except Exception as e:
                     print(f"解密失败 {current_path}: {e}")
             elif isinstance(n, Directory) and recursive:
-                for child in n.children.values():
+                for child in n._children.values():
                     child_path = current_path + "/" + child.name
                     decrypt_node(child, child_path)
 
@@ -21888,7 +22453,7 @@ def register(api):
                 if isinstance(node, File):
                     total_files += 1
                 elif isinstance(node, Directory):
-                    for child in node.children.values():
+                    for child in node._children.values():
                         count_files(child)
 
             count_files(src_obj)
@@ -21900,7 +22465,7 @@ def register(api):
 
                     def copy_with_progress(src_node, dst_parent, dst_name):
                         if isinstance(src_node, File):
-                            if dst_name in dst_parent.children and not over:
+                            if dst_name in dst_parent._children and not over:
                                 if gui_app and gui_app.winfo_exists():
                                     if not messagebox.askyesno(
                                         "覆盖确认",
@@ -21914,7 +22479,7 @@ def register(api):
                                     if input().strip().lower() != "y":
                                         pbar.update(1)
                                         return
-                            dst_parent.children[dst_name] = File(
+                            dst_parent._children[dst_name] = File(
                                 dst_name,
                                 dst_parent,
                                 src_node.content,
@@ -21924,8 +22489,8 @@ def register(api):
                             pbar.update(1)
                         elif isinstance(src_node, Directory):
                             new_dir = Directory(dst_name, dst_parent, self.username, src_node.mode)
-                            dst_parent.children[dst_name] = new_dir
-                            for child in src_node.children.values():
+                            dst_parent._children[dst_name] = new_dir
+                            for child in src_node._children.values():
                                 copy_with_progress(child, new_dir, child.name)
 
                     dst_parent = self.fs.resolve(os.path.dirname(dst_abs), self.username)
@@ -22176,20 +22741,6 @@ def register(api):
         self.admin_users.remove(user)
         self._save_admin_list(self.admin_users)  # 保存到全局文件
         print(f"✅ 用户 {user} 已从管理员列表中移除。")
-        self._finalize_prompt()
-
-    @command("listadmin", "admin", "列出所有管理员用户")
-    def listadmin_cmd(self, args, src=None):
-        if not self._is_admin():
-            print("❌ 只有管理员可以查看管理员列表")
-            self._finalize_prompt()
-            return
-        print("📋 当前管理员列表:")
-        for user in self.admin_users:
-            if user in self.users:
-                print(f"  ✅ {user} (活跃)")
-            else:
-                print(f"  ⚠️ {user} (用户已删除)")
         self._finalize_prompt()
 
     def _save_users(self):
@@ -22462,22 +23013,6 @@ def register(api):
             self._finalize_prompt()
             return
         # ==========================================
-
-        # ===== 拦截所有 python -c 命令，重定向到沙盒 =====
-        stripped = cmd_line.strip()
-        # 匹配 python -c 或 python -c" 或 python -c ' 等
-        if (
-            stripped.startswith(("python -c ", 'python -c"', "python -c'"))
-        ):
-            # 提取 -c 后面的部分（去掉前面的 "python -c " 或 "python -c"）
-            code_part = stripped[10:].strip()
-            # 如果代码被引号包裹，去除最外层引号
-            if code_part.startswith('"') and code_part.endswith('"') or code_part.startswith("'") and code_part.endswith("'"):
-                code_part = code_part[1:-1]
-            # 直接交给沙盒执行
-            self._safe_exec_python(code_part)
-            return
-        # =============================================
 
         # ===== exec 命令特殊捕获（避免 shlex 截断） =====
         stripped = cmd_line.strip()
@@ -23683,11 +24218,10 @@ class PluginAPI:
             self._func_map[self.current_plugin] = {}
         self._func_map[self.current_plugin][name] = func.__name__
 
-        # 立即注册一个占位命令
-        def placeholder(*args, **kwargs):
-            print(f"⚠️ 命令 {name} 未正确加载，请稍后重试")
-
-        self.shell.COMMANDS[name] = (placeholder, help_text, "plugin")
+        # 注册到普通字典 _command_registry，而非只读 COMMANDS
+        self.shell._command_registry[name] = (func, help_text, "plugin")
+        # 刷新只读代理
+        self.shell.COMMANDS = types.MappingProxyType(self.shell._command_registry)
         self.registered[self.current_plugin]["commands"].append(name)
 
     def add_menu_item(self, text, callback, parent_label="插件"):
@@ -23724,9 +24258,25 @@ class PluginManager:
         self.plugin_modules = {}  # name -> module
         self.api = None
         self.loaded = False
+        self.trusted_plugins = self._load_trusted_plugins()
         # 获取 kiki_os.py 的绝对路径
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.plugins_dir = os.path.join(script_dir, "plugins")
+        self.plugins_dir = os.path.join(KIKI_DATA_DIR, "plugins")
+
+    def _load_trusted_plugins(self):
+        try:
+            content = self.shell.fs.read_file("/home/admin/.kiki_trusted_plugins", "admin")
+            if content:
+                return json.loads(content)
+        except:
+            pass
+        return []
+
+    def _save_trusted_plugins(self):
+        try:
+            self.shell.fs.write_file("/home/admin/.kiki_trusted_plugins", json.dumps(self.trusted_plugins), "admin")
+        except:
+            pass
 
     def load_all(self):
         """扫描 plugins/ 目录，加载所有 .py 插件"""
@@ -23744,6 +24294,7 @@ class PluginManager:
     def load_plugin(self, name):
         import importlib.util
         import os
+        import types
         from tkinter import messagebox
 
         path = os.path.join(self.plugins_dir, name + ".py")
@@ -23752,11 +24303,15 @@ class PluginManager:
             return False
 
         if hasattr(self.gui, "winfo_exists") and self.gui.winfo_exists():
-            if not messagebox.askyesno(
-                "加载插件确认", f"是否允许加载插件 '{name}'？", icon="warning"
-            ):
-                print(f"用户取消了插件加载: {name}")
-                return False
+            if name not in self.trusted_plugins:
+                if not messagebox.askyesno(
+                    "加载插件确认", f"是否允许加载插件 '{name}'？", icon="warning"
+                ):
+                    print(f"用户取消了插件加载: {name}")
+                    return False
+                else:
+                    self.trusted_plugins.append(name)
+                    self._save_trusted_plugins()
 
         spec = importlib.util.spec_from_file_location(name, path)
         module = importlib.util.module_from_spec(spec)
@@ -23775,6 +24330,10 @@ class PluginManager:
             self.api = PluginAPI(self.gui, self.shell)
         self.api.set_current_plugin(name)
 
+        # 确保 _command_registry 是普通字典（可能被映射为只读）
+        if isinstance(self.shell._command_registry, types.MappingProxyType):
+            self.shell._command_registry = dict(self.shell._command_registry)
+
         # 在主进程中执行 register（注册命令和菜单）
         try:
             module.register(self.api)
@@ -23786,58 +24345,38 @@ class PluginManager:
         self.plugin_modules[name] = module
         self.plugins[name] = module.plugin_info
 
-        # ===== 替换已注册命令为沙盒版 =====
+        # ===== 替换已注册命令为 subprocess 隔离版 =====
         if name in self.api._func_map:
             for cmd_name, func_name in self.api._func_map[name].items():
-                if cmd_name in self.shell.COMMANDS:
+                if cmd_name in self.shell._command_registry:
                     plugin_path = path
 
-                    # 创建沙盒包装器
+                    # 创建 subprocess 隔离包装器（不会导入主模块，避免卡死）
                     def sandbox_cmd(
                         args=None,
                         src=None,
                         plugin_path=plugin_path,
                         func_name=func_name,
                     ):
-                        import multiprocessing
-
-                        output_queue = multiprocessing.Queue()
-                        p = multiprocessing.Process(
-                            target=_plugin_command_sandbox_target,
-                            args=(plugin_path, func_name, args or "", output_queue),
-                        )
-                        p.start()
-                        p.join(timeout=10)
-                        output = ""
-                        error = ""
-                        if not output_queue.empty():
-                            msg = output_queue.get()
-                            if msg[0] == "result":
-                                output = msg[1]
-                                error = msg[2]
-                            elif msg[0] == "exception":
-                                error = msg[1]
-                        if p.is_alive():
-                            p.terminate()
-                            p.join()
-                            error += "\n⚠️ 插件命令执行超时，已强制终止。"
-                        if output:
+                        output, error = _run_plugin_script(plugin_path, func_name, args or "")
+                        if error:
+                            if self.gui:
+                                self.gui._print(f"❌ {error}\n")
+                            else:
+                                print(f"❌ {error}")
+                        elif output:
                             if self.gui:
                                 self.gui._print(output)
                             else:
                                 print(output)
-                        if error:
-                            if self.gui:
-                                self.gui._print(error)
-                            else:
-                                print(error)
 
-                    # 替换
-                    self.shell.COMMANDS[cmd_name] = (
+                    # 替换到 _command_registry，并刷新 COMMANDS
+                    self.shell._command_registry[cmd_name] = (
                         sandbox_cmd,
-                        self.shell.COMMANDS[cmd_name][1],
+                        self.shell._command_registry[cmd_name][1],
                         "plugin",
                     )
+                    self.shell.COMMANDS = types.MappingProxyType(self.shell._command_registry)
         # ==================================
 
         print(f"✅ 插件 {name} 加载成功")
@@ -24396,7 +24935,7 @@ class SecurityCenterWindow(KikiWindow):
                         self.after(0, lambda: self.progress_bar.set(total / max(1, 100)))
 
                 elif isinstance(node, Directory):
-                    for child in node.children.values():
+                    for child in node._children.values():
                         walk_dir(
                             child,
                             (
@@ -24508,6 +25047,8 @@ class KIKIGUI(ctk.CTk):
         self.vol_win = None
         self.vol_btn = None
         self._menu_window = None
+        self._taskbar_preview_win = None
+        self._hide_preview_after_id = None
         self._menu_animating = False
         self.taskbar_buttons = {}
         self.window_id_map = {}
@@ -24851,32 +25392,45 @@ class KIKIGUI(ctk.CTk):
         except Exception:
             pass
 
-    def _stop_all_jiggle(self):
-        """停止所有图标的抖动并删除 ✕ 按钮"""
+    def _show_delete_button(self, btn, icon_id):
+        self._hide_delete_buttons()
+        if hasattr(btn, "_delete_btn") and btn._delete_btn:
+            return
+        try:
+            btn_x = btn.winfo_rootx() - self.icon_frame.winfo_rootx()
+            btn_y = btn.winfo_rooty() - self.icon_frame.winfo_rooty()
+            btn_w = btn.winfo_width()
+            btn_h = btn.winfo_height()
+            del_w = 20
+            del_h = 20
+            # 放在图标右上角外侧（右偏2px，上偏2px）
+            delete_x = btn_x + btn_w - del_w - 2
+            delete_y = btn_y + 2
+            container_w = self.icon_frame.winfo_width()
+            container_h = self.icon_frame.winfo_height()
+            delete_x = max(0, min(delete_x, container_w - del_w))
+            delete_y = max(0, min(delete_y, container_h - del_h))
+            delete_btn = ctk.CTkButton(
+                self.icon_frame,
+                text="✕",
+                width=del_w,
+                height=del_h,
+                fg_color="#ff4444",
+                hover_color="#cc0000",
+                text_color="white",
+                font=("Arial", 10, "bold"),
+                corner_radius=10,
+            )
+            delete_btn.bind("<Button-1>", lambda e: self._delete_desktop_icon(icon_id))
+            delete_btn.place(x=delete_x, y=delete_y)
+            btn._delete_btn = delete_btn
+        except Exception:
+            pass
+
+    def _hide_delete_buttons(self):
         for icon_id, info in list(self.desktop_icons.items()):
             btn = info.get("widget")
-            if btn is None:
-                continue
-            try:
-                if not btn.winfo_exists():
-                    continue
-            except Exception:
-                continue
-
-            # 停止抖动
-            if hasattr(btn, "_jiggle_running"):
-                btn._jiggle_running = False
-
-            # 恢复位置
-            try:
-                btn.grid_info()["row"]
-                btn.grid_info()["column"]
-                btn.grid_configure(padx=self.icon_spacing_x, pady=self.icon_spacing_y)
-            except Exception:
-                pass
-
-            # 删除 ✕ 按钮（兼容 tk.Button 和 ctk.CTkButton）
-            if hasattr(btn, "_delete_btn") and btn._delete_btn is not None:
+            if btn and hasattr(btn, "_delete_btn") and btn._delete_btn:
                 try:
                     if btn._delete_btn.winfo_exists():
                         btn._delete_btn.destroy()
@@ -24884,11 +25438,87 @@ class KIKIGUI(ctk.CTk):
                     pass
                 btn._delete_btn = None
 
+    def _desktop_icon_right_click(self, event, icon_id, btn):
+        info = self.desktop_icons.get(icon_id)
+        if not info:
+            return
+        menu = tk.Menu(self, tearoff=0)
+
+        open_cmd = info.get("command")
+        if open_cmd:
+            menu.add_command(label="打开", command=open_cmd)
+        else:
+            menu.add_command(label="打开", state="disabled")
+
+        menu.add_command(label="重命名", command=lambda: self._rename_icon(event, icon_id, btn))
+
+        if info.get("is_dynamic", False):
+            menu.add_command(label="删除快捷方式", command=lambda: self._delete_desktop_icon(icon_id))
+        else:
+            menu.add_command(label="删除快捷方式", command=lambda: messagebox.showinfo("提示", "系统图标不能删除"))
+
+        path = info.get("path")
+        if path:
+            node = self.shell.fs.resolve(path, self.username)
+            if node and not isinstance(node, Directory):
+                menu.add_command(label="用 KIKI OS 编辑器打开", command=lambda: self._open_editor_with_file(path))
+            else:
+                menu.add_command(label="用 KIKI OS 编辑器打开", state="disabled")
+            menu.add_command(label="压缩所选", command=lambda: self._compress_desktop_icon(path))
+        else:
+            menu.add_command(label="用 KIKI OS 编辑器打开", state="disabled")
+            menu.add_command(label="压缩所选", state="disabled")
+
+        menu.add_separator()
+        menu.add_command(label="属性", command=lambda: messagebox.showinfo("属性", f"目标: {info.get('path', '系统图标')}"))
+
+        menu.post(event.x_root, event.y_root)
+
+    def _compress_desktop_icon(self, path):
+        if not path:
+            messagebox.showinfo("提示", "没有可压缩的文件")
+            return
+        self.shell._execute(f"compress {path}")
+
+        self._create_desktop_icons()
+
+    def _open_with_notepad_from_desktop(self, icon_id):
+        info = self.desktop_icons.get(icon_id)
+        if not info or not info.get("path"):
+            messagebox.showinfo("提示", "该图标没有对应的文件")
+            return
+        path = info["path"]
+        try:
+            content = self.shell.fs.read_file(path, self.username)
+            if content is None:
+                node = self.shell.fs.resolve(path, self.username)
+                if node and hasattr(node, "read"):
+                    raw = node.read()
+                    content = raw.decode("utf-8", errors="ignore") if raw else ""
+            if content is None:
+                messagebox.showinfo("提示", "无法读取文件内容")
+                return
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="ignore")
+            if not isinstance(content, str):
+                content = str(content)
+        except Exception as e:
+            messagebox.showinfo("提示", f"读取文件失败: {e}")
+            return
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as f:
+            f.write(content.encode("utf-8"))
+            temp_path = f.name
+        import subprocess
+        if sys.platform == "win32":
+            subprocess.Popen(["notepad.exe", temp_path])
+        else:
+            subprocess.Popen(["xdg-open", temp_path])
+
     def _delete_desktop_icon(self, icon_id):
-        # 尝试直接查找
         info = self.desktop_icons.get(icon_id)
         if info is None:
-            # 尝试模糊匹配（可能传入的是部分ID）
+            # 模糊匹配
             for iid in list(self.desktop_icons.keys()):
                 if icon_id in iid or iid in icon_id:
                     icon_id = iid
@@ -24897,50 +25527,30 @@ class KIKIGUI(ctk.CTk):
             else:
                 messagebox.showinfo("提示", "无法找到要删除的图标")
                 return
-
         if info is None:
             messagebox.showinfo("提示", "无法找到要删除的图标")
             return
-
         btn = info.get("widget")
-
-        # 如果是动态图标，直接删除
+        # 动态图标：确认后删除
         if info.get("is_dynamic", False):
-            # 先停止抖动
+            if not messagebox.askyesno("确认删除", f"确定要删除快捷方式 '{info['name']}' 吗？", parent=self):
+                return
+            # 隐藏所有删除按钮
+            self._hide_delete_buttons()
             if btn is not None:
                 try:
                     if btn.winfo_exists():
-                        if hasattr(btn, "_jiggle_running"):
-                            btn._jiggle_running = False
-                        # 删除叉号按钮
-                        if hasattr(btn, "_delete_btn") and btn._delete_btn is not None:
-                            try:
-                                if btn._delete_btn.winfo_exists():
-                                    btn._delete_btn.destroy()
-                            except Exception:
-                                pass
-                            btn._delete_btn = None
-                        # 销毁图标按钮
                         btn.destroy()
-                except Exception as e:
-                    messagebox.showinfo("删除图标按钮时出错", str(e))
-
-            # 从字典中移除
-            name = info.get("name", "")
-            del self.desktop_icons[icon_id]
-            self._save_dynamic_icons()
-            self._show_notification(f"已删除快捷方式: {name}")
-
-            # 停止所有抖动
-            self.after(100, self._stop_all_jiggle)
-        else:
-            # 固定图标不能删除，只停止抖动
-            if btn is not None:
-                try:
-                    if btn.winfo_exists():
-                        self._stop_icon_jiggle(btn)
                 except Exception:
                     pass
+            name = info.get("name", "")
+            del self.desktop_icons[icon_id]
+            if icon_id in self.desktop_icon_positions:
+                del self.desktop_icon_positions[icon_id]
+            self._save_dynamic_icons()
+            self._show_notification(f"已删除快捷方式: {name}")
+        else:
+            # 固定图标：提示
             messagebox.showinfo("提示", f"'{info.get('name', '')}' 是系统图标，不能删除")
 
     def _show_menu_with_plugins(self, btn, label):
@@ -25255,22 +25865,20 @@ class KIKIGUI(ctk.CTk):
                 btn_frame = ctk.CTkFrame(item_frame, fg_color="transparent")
                 btn_frame.pack(side="right")
 
-                # 🔥 安全修复：先隐藏搜索面板，再执行操作
                 def open_res(p=path):
-                    # 1. 立刻销毁搜索面板，防止和新窗口发生 UI 冲突
                     self.search_overlay.place_forget()
                     for w in self.search_results_list.winfo_children():
                         w.destroy()
                     self.unbind_all("<Button-1>")
 
-                    # 2. 给 50ms 缓冲，等 Tkinter 把搜索框完全从事件循环移除
                     def do_open():
                         try:
-                            node = self.shell.fs.resolve(p, self.username)
+                            normalized = self.shell.fs._resolve(p)
+                            node = self.shell.fs.resolve(normalized, self.username)
                             if isinstance(node, Directory):
-                                self._open_fm_at(p)
+                                self._open_fm_at(normalized)
                             else:
-                                self._open_editor_with_file(p)
+                                self._open_editor_with_file(normalized)
                         except Exception as e:
                             self._print(f"打开文件失败: {e}\n")
 
@@ -25281,24 +25889,21 @@ class KIKIGUI(ctk.CTk):
                 )
                 open_btn.pack(side="left", padx=2)
 
-                # 🔥 新增：打开所在文件夹的按钮（同样采用先销毁后打开的逻辑）
                 def open_location(p=path):
-                    # 1. 立刻销毁搜索面板
                     self.search_overlay.place_forget()
                     for w in self.search_results_list.winfo_children():
                         w.destroy()
                     self.unbind_all("<Button-1>")
 
-                    # 2. 给 50ms 缓冲，防止冲突
                     def do_open_loc():
                         try:
-                            # 如果是文件，取目录；如果是文件夹，直接打开
-                            parent_dir = (
-                                os.path.dirname(p)
-                                if isinstance(self.shell.fs.resolve(p, self.username), File)
-                                else p
-                            )
-                            self._open_fm_at(parent_dir)
+                            node = self.shell.fs.resolve(p, self.username)
+                            if isinstance(node, Directory):
+                                parent_dir = p
+                            else:
+                                parent_dir = os.path.dirname(p) if not p.endswith("/") else p
+                            parent_normalized = self.shell.fs._resolve(parent_dir)
+                            self._open_fm_at(parent_normalized)
                         except Exception as e:
                             self._print(f"打开所在位置失败: {e}\n")
 
@@ -25539,215 +26144,26 @@ class KIKIGUI(ctk.CTk):
             if top and top != self and hasattr(top, "destroy"):
                 top.destroy()
 
-    def _on_icon_press(self, event, icon_id, btn):
-        if btn is None or not btn.winfo_exists():
-            return
-        if hasattr(btn, "_click_after_id") and btn._click_after_id:
-            try:
-                btn.after_cancel(btn._click_after_id)
-            except Exception:
-                pass
-            btn._click_after_id = None
-        if hasattr(btn, "_press_timer") and btn._press_timer:
-            try:
-                btn.after_cancel(btn._press_timer)
-            except Exception:
-                pass
-            btn._press_timer = None
-        btn._press_x = event.x_root
-        btn._press_y = event.y_root
-        btn._is_dragging = False
-        btn._is_jiggling = False
-        btn._orig_drag_pos = (btn.winfo_x(), btn.winfo_y())
-        btn._last_drag_pos = (btn.winfo_x(), btn.winfo_y())
-        if not hasattr(btn, "_last_click_time"):
-            btn._last_click_time = None
-            btn._click_count = 0
-
-        def long_press():
-            if btn is None or not btn.winfo_exists():
-                return
-            if getattr(btn, "_is_dragging", False):
-                return
-            btn._is_jiggling = True
-            self._start_icon_jiggle(btn, icon_id)
-            btn._press_timer = None
-
-        btn._press_timer = btn.after(600, long_press)
-
-    def _on_icon_drag(self, event, icon_id, btn):
-        if icon_id not in self.desktop_icons:
-            return
-        if getattr(btn, "_is_jiggling", False):
-            return
-        dx = abs(event.x_root - btn._press_x)
-        dy = abs(event.y_root - btn._press_y)
-        if dx > 10 or dy > 10:
-            # 首次判定为拖拽时，初始化状态
-            if not btn._is_dragging:
-                btn._is_dragging = True
-                # 取消长按定时器与单击定时器
-                if hasattr(btn, "_press_timer") and btn._press_timer:
-                    try:
-                        btn.after_cancel(btn._press_timer)
-                    except Exception:
-                        pass
-                    btn._press_timer = None
-                if hasattr(btn, "_click_after_id") and btn._click_after_id:
-                    try:
-                        btn.after_cancel(btn._click_after_id)
-                    except Exception:
-                        pass
-                    btn._click_after_id = None
-                btn._last_click_time = None
-                btn._click_count = 0
-                # 禁用 hover 效果，避免闪烁
-                btn.configure(hover_color="transparent", fg_color="transparent")
-                # 将图标提升到最上层（仅一次）
-                btn.lift()
-
-            offset = self.icon_size // 2
-            raw_x = event.x_root - self.icon_frame.winfo_rootx() - offset
-            raw_y = event.y_root - self.icon_frame.winfo_rooty() - offset
-            btn._raw_drag_pos = (raw_x, raw_y)
-
-            max_x = self.icon_frame.winfo_width() - self.icon_size
-            max_y = self.icon_frame.winfo_height() - self.icon_size
-
-            # === 固定网格基准（与初始图标位置一致） ===
-            grid_x = self.icon_grid_x
-            grid_y = self.icon_grid_y
-            # 使用固定的 20 作为网格原点，避免动态计算导致抖动
-            origin_x = 20
-            origin_y = 20
-            aligned_x = round((raw_x - origin_x) / grid_x) * grid_x + origin_x
-            aligned_y = round((raw_y - origin_y) / grid_y) * grid_y + origin_y
-            new_x = max(0, min(aligned_x, max_x))
-            new_y = max(0, min(aligned_y, max_y))
-            # ============================
-
-            # 只有位置真正变化时才更新，防止闪烁
-            if (new_x, new_y) != btn._last_drag_pos:
-                btn._last_drag_pos = (new_x, new_y)
-                btn.place(x=new_x, y=new_y)
-
-    def _on_icon_release(self, event, icon_id, btn):
-        if icon_id not in self.desktop_icons:
-            return
-
-        # 1. 取消长按定时器
-        if hasattr(btn, "_press_timer") and btn._press_timer:
-            try:
-                btn.after_cancel(btn._press_timer)
-            except Exception:
-                pass
-            btn._press_timer = None
-
-        # 2. 处理抖动状态（如果有）
-        if btn._is_jiggling:
-            def global_click_cancel(e, current_btn=btn):
-                if current_btn._delete_btn is not None:
-                    try:
-                        if e.widget == current_btn._delete_btn:
-                            return
-                    except Exception:
-                        pass
-                self._stop_icon_jiggle(current_btn)
-                current_btn._is_jiggling = False
-                self.unbind_all("<Button-1>")
-
-            self.bind_all("<Button-1>", global_click_cancel, add="+")
-            # 恢复默认样式（因为抖动时可能修改了）
-            btn.configure(hover_color="#4a9eff", fg_color="transparent")
-            return
-
-        # 3. 处理拖拽结束（先处理再恢复样式）
-        if btn._is_dragging:
-            self._perform_snap_and_push(btn, icon_id)
-            btn._is_dragging = False
-            # 恢复样式
-            btn.configure(hover_color="#4a9eff", fg_color="transparent")
-            return
-
-        # 4. 正常单击/双击逻辑
-        # 恢复默认样式（确保）
-        btn.configure(hover_color="#4a9eff", fg_color="transparent")
-
-        now = time.time()
-        if btn._last_click_time is None:
-            btn._last_click_time = now
-            btn._click_count = 1
-
-            def delayed_open():
-                if btn._click_count == 1:
-                    info = self.desktop_icons.get(icon_id)
-                    if info and info.get("command"):
-                        info["command"]()
-                btn._click_after_id = None
-                btn._last_click_time = None
-                btn._click_count = 0
-
-            btn._click_after_id = btn.after(500, delayed_open)
-            return
-        else:
-            elapsed = now - btn._last_click_time
-            if elapsed < 0.5:  # 双击
-                if hasattr(btn, "_click_after_id") and btn._click_after_id:
-                    try:
-                        btn.after_cancel(btn._click_after_id)
-                    except Exception:
-                        pass
-                    btn._click_after_id = None
-                btn._last_click_time = None
-                btn._click_count = 0
-                self._rename_icon(event, icon_id, btn)  # 双击重命名
-                return
-            else:
-                # 视为新单击
-                btn._last_click_time = now
-                btn._click_count = 1
-
-                def delayed_open2():
-                    if btn._click_count == 1:
-                        info = self.desktop_icons.get(icon_id)
-                        if info and info.get("command"):
-                            info["command"]()
-                    btn._click_after_id = None
-                    btn._last_click_time = None
-                    btn._click_count = 0
-
-                btn._click_after_id = btn.after(500, delayed_open2)
-                return
-
     def _perform_snap_and_push(self, btn, icon_id):
-        # 获取当前图标位置（已网格对齐）
         x, y = btn.winfo_x(), btn.winfo_y()
-
-        # 检查该位置是否与已有图标重叠
-        if not self._is_position_occupied(x, y, btn):
-            # 无冲突，直接停稳
-            self.desktop_icon_positions[icon_id] = (x, y)
-            self._save_dynamic_icons()
-            return
-
-        # 有冲突，寻找一个空闲的网格位置
-        empty_slot = self._find_empty_slot()
-        if empty_slot:
-            btn.place(x=empty_slot[0], y=empty_slot[1])
-            btn.lift()
-            self.desktop_icon_positions[icon_id] = empty_slot
-            self._save_dynamic_icons()
-        else:
-            # 找不到空位，强制放置在最右下角（确保不重叠）
-            max_x = max(0, self.icon_frame.winfo_width() - self.icon_size)
-            max_y = max(0, self.icon_frame.winfo_height() - self.icon_size)
-            btn.place(x=max_x, y=max_y)
-            btn.lift()
-            self.desktop_icon_positions[icon_id] = (max_x, max_y)
-            self._save_dynamic_icons()
+        # 网格对齐
+        grid_x = self.icon_grid_x
+        grid_y = self.icon_grid_y
+        origin_x = 20
+        origin_y = 20
+        x = max(0, min(round((x - origin_x) / grid_x) * grid_x + origin_x, self.icon_frame.winfo_width() - self.icon_size))
+        y = max(0, min(round((y - origin_y) / grid_y) * grid_y + origin_y, self.icon_frame.winfo_height() - self.icon_size))
+        # 检查该位置是否被占用
+        if self._is_position_occupied(x, y, btn):
+            empty_slot = self._find_empty_grid_slot()
+            if empty_slot:
+                x, y = empty_slot
+        btn.place(x=x, y=y)
+        self.desktop_icon_positions[icon_id] = (x, y)
+        self._save_dynamic_icons()
 
     def _is_position_occupied(self, x, y, exclude_widget=None):
-        """检查坐标 (x, y) 是否被除 exclude_widget 外的其他图标占据（距离 < icon_size 视为重叠）"""
+        """检查 (x,y) 是否被其他图标占据（距离 < icon_size 视为重叠）"""
         for info in self.desktop_icons.values():
             other = info.get("widget")
             if other and other != exclude_widget and other.winfo_exists():
@@ -25772,68 +26188,6 @@ class KIKIGUI(ctk.CTk):
                 if not self._is_position_occupied(pos_x, pos_y):
                     return (pos_x, pos_y)
         return None
-
-    def _rename_icon(self, event, icon_id, btn):
-        if icon_id not in self.desktop_icons:
-            return
-        info = self.desktop_icons[icon_id]
-        old_name = info["name"]
-        # 使用原始位置，避免偏移
-        if hasattr(btn, "_orig_drag_pos"):
-            current_x, current_y = btn._orig_drag_pos
-        else:
-            current_x, current_y = btn.winfo_x(), btn.winfo_y()
-
-        btn.place_forget()
-        entry = tk.Entry(
-            self.icon_frame,
-            font=("Arial", self.icon_font_size),
-            bg="#2b2b2b",
-            fg="white",
-            insertbackground="white",
-            relief="flat",
-            width=max(10, len(old_name) + 2),
-        )
-        entry.place(x=current_x, y=current_y, width=self.icon_size, height=self.icon_size)
-        entry.insert(0, old_name)
-        entry.select_range(0, tk.END)
-        entry.focus_force()
-        entry.icursor(tk.END)
-
-        completed = [False]
-
-        def finish_rename(new_name=None, cancel=False):
-            if completed[0]:
-                return
-            completed[0] = True
-            if cancel:
-                new_name = old_name
-            else:
-                new_name = entry.get().strip()
-                if not new_name:
-                    new_name = old_name
-            icon_symbol = btn.cget("text").split("\n")[0]
-            btn.configure(text=f"{icon_symbol}\n{new_name}")
-            info["name"] = new_name
-            btn.place(x=current_x, y=current_y)
-            entry.destroy()
-            self._save_dynamic_icons()
-
-        entry.bind("<Return>", lambda e: finish_rename())
-        entry.bind("<FocusOut>", lambda e: finish_rename(cancel=True))
-
-        def global_click(e):
-            if not entry.winfo_exists():
-                return
-            x1 = entry.winfo_rootx()
-            y1 = entry.winfo_rooty()
-            x2 = x1 + entry.winfo_width()
-            y2 = y1 + entry.winfo_height()
-            if not (x1 <= e.x_root <= x2 and y1 <= e.y_root <= y2):
-                finish_rename(cancel=True)
-                self.unbind_all("<Button-1>")
-
-        self.bind_all("<Button-1>", global_click)
 
     def _start_icon_jiggle(self, btn, icon_id):
         if btn is None or not btn.winfo_exists():
@@ -25886,8 +26240,6 @@ class KIKIGUI(ctk.CTk):
             return
         try:
             if btn.winfo_exists():
-                if hasattr(btn, "_jiggle_running"):
-                    btn._jiggle_running = False
                 if hasattr(btn, "_delete_btn") and btn._delete_btn is not None:
                     try:
                         if btn._delete_btn.winfo_exists():
@@ -25898,15 +26250,31 @@ class KIKIGUI(ctk.CTk):
         except Exception:
             pass
 
+    def _stop_all_jiggle(self):
+        for icon_id, info in list(self.desktop_icons.items()):
+            btn = info.get("widget")
+            if btn is None:
+                continue
+            try:
+                if not btn.winfo_exists():
+                    continue
+            except Exception:
+                continue
+            if hasattr(btn, "_delete_btn") and btn._delete_btn is not None:
+                try:
+                    if btn._delete_btn.winfo_exists():
+                        btn._delete_btn.destroy()
+                except Exception:
+                    pass
+                btn._delete_btn = None
+
     def _create_desktop_icons(self):
-        """创建桌面图标：从VFS读取配置，恢复固定图标和动态快捷方式的位置"""
-        # 清空旧图标
+        """创建桌面图标：固定图标 + 动态快捷方式"""
         for child in self.icon_frame.winfo_children():
             child.destroy()
         self.desktop_icons.clear()
         self.desktop_icon_positions.clear()
 
-        # 1. 从配置读取已保存的图标名称和位置
         if self.username:
             try:
                 config_content = self.shell.fs.read_file(
@@ -25920,34 +26288,30 @@ class KIKIGUI(ctk.CTk):
                 else:
                     self.desktop_icon_names = {}
                     self.desktop_icon_positions = {}
-            except Exception as e:
-                print(f"[Desktop] 读取用户配置失败: {e}")
+            except Exception:
                 self.desktop_icon_names = {}
                 self.desktop_icon_positions = {}
         else:
             self.desktop_icon_names = {}
             self.desktop_icon_positions = {}
 
-        # 2. 创建固定图标（我的电脑、回收站、终端、设置、文档、AI聊天）
         fixed_icons = [
-            ("🖥️", "我的电脑", lambda: self._open_fm_at("/"), "fixed"),
-            ("♻️", "回收站", self._open_trash, "fixed"),
-            ("🖥️", "终端", self._open_floating_terminal, "fixed"),
-            ("⚙️", "设置", self._open_settings, "fixed"),
-            ("📁", "文档", self._open_documents, "fixed"),
-            ("🤖", "AI 聊天", self._open_ai_chat, "fixed"),
+            ("🖥️", "我的电脑", lambda: self._open_fm_at("/")),
+            ("♻️", "回收站", self._open_trash),
+            ("🖥️", "终端", self._open_floating_terminal),
+            ("⚙️", "设置", self._open_settings),
+            ("📁", "文档", self._open_documents),
+            ("🤖", "AI 聊天", self._open_ai_chat),
         ]
 
-        for idx, (icon, label, cmd, typ) in enumerate(fixed_icons):
+        for idx, (icon, label, cmd) in enumerate(fixed_icons):
             icon_id = f"fixed_{label}"
-            # 从配置读取该固定图标的位置，若不存在则使用默认网格位置
             if icon_id in self.desktop_icon_positions:
-                saved_x, saved_y = self.desktop_icon_positions[icon_id]
-                # 确保坐标在有效范围内
-                x = max(0, min(saved_x, self.icon_frame.winfo_width() - self.icon_size))
-                y = max(0, min(saved_y, self.icon_frame.winfo_height() - self.icon_size))
+                x, y = self.desktop_icon_positions[icon_id]
+                # 仅做边界检查，不做网格判断
+                x = max(0, min(x, self.icon_frame.winfo_width() - self.icon_size))
+                y = max(0, min(y, self.icon_frame.winfo_height() - self.icon_size))
             else:
-                # 默认网格位置：起点(20,20)，行距90
                 x = 20
                 y = 20 + idx * 90
 
@@ -25964,8 +26328,6 @@ class KIKIGUI(ctk.CTk):
                 corner_radius=8,
             )
             btn.place(x=x, y=y)
-
-            # 注册到图标字典并记录位置
             self.desktop_icons[icon_id] = {
                 "widget": btn,
                 "name": label,
@@ -25975,17 +26337,331 @@ class KIKIGUI(ctk.CTk):
             }
             self.desktop_icon_positions[icon_id] = (x, y)
 
-            # 绑定事件
-            btn.bind("<Button-1>", lambda e, iid=icon_id, b=btn: self._on_icon_press(e, iid, b))
+            btn.bind("<ButtonPress-1>", lambda e, iid=icon_id, b=btn: self._on_icon_press(e, iid, b))
             btn.bind("<B1-Motion>", lambda e, iid=icon_id, b=btn: self._on_icon_drag(e, iid, b))
             btn.bind("<ButtonRelease-1>", lambda e, iid=icon_id, b=btn: self._on_icon_release(e, iid, b))
+            btn.bind("<Button-3>", lambda e, iid=icon_id, b=btn: self._desktop_icon_right_click(e, iid, b))
 
-        # 3. 恢复动态快捷方式（若存在）
         if self.username:
             self._restore_dynamic_icons()
-
-        # 4. 强制保存一次，确保新创建的固定图标位置也写入配置
         self._save_dynamic_icons()
+
+    def _add_desktop_icon(self, target_path, display_name=None, x=None, y=None):
+        if not target_path:
+            return None
+        if display_name is None:
+            display_name = os.path.basename(target_path)
+            if not display_name:
+                display_name = "快捷方式"
+
+        for icon_id, info in self.desktop_icons.items():
+            if info.get("path") == target_path:
+                return info["widget"]
+
+        node = self.shell.fs.resolve(target_path, self.username)
+        if node is None:
+            icon_symbol = "❓"
+        elif isinstance(node, Directory):
+            icon_symbol = "📁"
+        else:
+            ext = os.path.splitext(display_name)[1].lower()
+            icon_map = {
+                ".py": "📜", ".sh": "📜", ".bat": "📜",
+                ".jpg": "🖼️", ".png": "🖼️", ".gif": "🖼️",
+                ".mp3": "🎵", ".wav": "🎵",
+                ".mp4": "🎬", ".avi": "🎬",
+                ".zip": "📦", ".rar": "📦",
+            }
+            icon_symbol = icon_map.get(ext, "📄")
+
+        def open_path_command():
+            self._open_desktop_icon(target_path)
+
+        btn = ctk.CTkButton(
+            self.icon_frame,
+            text=f"{icon_symbol}\n{display_name}",
+            width=self.icon_size,
+            height=self.icon_size,
+            command=None,
+            font=("Arial", self.icon_font_size),
+            fg_color="transparent",
+            hover_color="#4a9eff",
+            border_width=0,
+            corner_radius=8,
+        )
+
+        if x is None or y is None:
+            dynamic_list = self.shell.config.config.get("desktop", {}).get("dynamic_icons", [])
+            found = False
+            for item in dynamic_list:
+                if item.get("path") == target_path:
+                    x = item.get("x")
+                    y = item.get("y")
+                    found = True
+                    break
+            if not found:
+                empty_slot = self._find_empty_grid_slot()
+                if empty_slot:
+                    x, y = empty_slot
+                else:
+                    max_y = 20
+                    for info in self.desktop_icons.values():
+                        w = info.get("widget")
+                        if w and w.winfo_exists():
+                            wy = w.winfo_y()
+                            max_y = max(max_y, wy)
+                    x, y = 20, max_y + 90
+            if x is None or y is None:
+                x, y = 20, 20
+
+        # 网格对齐（确保 x, y 在网格上）
+        grid_x = self.icon_grid_x
+        grid_y = self.icon_grid_y
+        origin_x = 20
+        origin_y = 20
+        x = max(0, min(round((x - origin_x) / grid_x) * grid_x + origin_x, self.icon_frame.winfo_width() - self.icon_size))
+        y = max(0, min(round((y - origin_y) / grid_y) * grid_y + origin_y, self.icon_frame.winfo_height() - self.icon_size))
+
+        if x < 0: x = 20
+        if y < 0: y = 20
+
+        icon_id = f"dynamic_{self.dynamic_icon_counter}"
+        self.dynamic_icon_counter += 1
+        btn.place(x=x, y=y)
+
+        btn.bind("<ButtonPress-1>", lambda e, iid=icon_id, b=btn: self._on_icon_press(e, iid, b))
+        btn.bind("<B1-Motion>", lambda e, iid=icon_id, b=btn: self._on_icon_drag(e, iid, b))
+        btn.bind("<ButtonRelease-1>", lambda e, iid=icon_id, b=btn: self._on_icon_release(e, iid, b))
+        btn.bind("<Button-3>", lambda e, iid=icon_id, b=btn: self._desktop_icon_right_click(e, iid, b))
+
+        self.desktop_icons[icon_id] = {
+            "widget": btn,
+            "name": display_name,
+            "path": target_path,
+            "is_dynamic": True,
+            "command": open_path_command,
+        }
+        self.desktop_icon_positions[icon_id] = (x, y)
+        self._save_dynamic_icons()
+        return btn
+
+    def _find_empty_grid_slot(self):
+        """寻找第一个空闲网格位置"""
+        origin_x = 20
+        origin_y = 20
+        grid_x = self.icon_grid_x
+        grid_y = self.icon_grid_y
+        max_col = max(1, int((self.icon_frame.winfo_width() - origin_x) // grid_x))
+        max_row = max(1, int((self.icon_frame.winfo_height() - origin_y) // grid_y))
+        for row in range(max_row):
+            for col in range(max_col):
+                pos_x = origin_x + col * grid_x
+                pos_y = origin_y + row * grid_y
+                if not self._is_position_occupied(pos_x, pos_y):
+                    return (pos_x, pos_y)
+        return None
+
+    def _on_icon_press(self, event, icon_id, btn):
+        self._hide_delete_buttons()
+        if btn is None or not btn.winfo_exists():
+            return
+        if hasattr(btn, "_click_after_id") and btn._click_after_id:
+            try:
+                btn.after_cancel(btn._click_after_id)
+            except Exception:
+                pass
+            btn._click_after_id = None
+        if hasattr(btn, "_press_timer") and btn._press_timer:
+            try:
+                btn.after_cancel(btn._press_timer)
+            except Exception:
+                pass
+            btn._press_timer = None
+        btn._press_x = event.x_root
+        btn._press_y = event.y_root
+        btn._is_dragging = False
+        btn._long_pressed = False
+        btn._orig_drag_pos = (btn.winfo_x(), btn.winfo_y())
+        btn._last_drag_pos = (btn.winfo_x(), btn.winfo_y())
+        if not hasattr(btn, "_last_click_time"):
+            btn._last_click_time = None
+            btn._click_count = 0
+
+        def long_press():
+            if btn is None or not btn.winfo_exists():
+                return
+            if getattr(btn, "_is_dragging", False):
+                return
+            # 改为设置长按标志，不再启动抖动
+            btn._long_pressed = True
+            btn._press_timer = None
+
+        btn._press_timer = btn.after(600, long_press)
+
+    def _on_icon_drag(self, event, icon_id, btn):
+        if icon_id not in self.desktop_icons:
+            return
+        if getattr(btn, "_long_pressed", False):
+            return
+        dx = abs(event.x_root - btn._press_x)
+        dy = abs(event.y_root - btn._press_y)
+        if dx > 10 or dy > 10:
+            # 首次判定为拖拽时，初始化状态
+            if not btn._is_dragging:
+                btn._is_dragging = True
+                if hasattr(btn, "_press_timer") and btn._press_timer:
+                    try:
+                        btn.after_cancel(btn._press_timer)
+                    except Exception:
+                        pass
+                    btn._press_timer = None
+                if hasattr(btn, "_click_after_id") and btn._click_after_id:
+                    try:
+                        btn.after_cancel(btn._click_after_id)
+                    except Exception:
+                        pass
+                    btn._click_after_id = None
+                btn._last_click_time = None
+                btn._click_count = 0
+                # 禁用 hover 效果，避免闪烁
+                btn.configure(hover_color="transparent", fg_color="transparent")
+                btn.lift()
+
+            offset = self.icon_size // 2
+            raw_x = event.x_root - self.icon_frame.winfo_rootx() - offset
+            raw_y = event.y_root - self.icon_frame.winfo_rooty() - offset
+            btn._raw_drag_pos = (raw_x, raw_y)
+
+            max_x = self.icon_frame.winfo_width() - self.icon_size
+            max_y = self.icon_frame.winfo_height() - self.icon_size
+
+            grid_x = self.icon_grid_x
+            grid_y = self.icon_grid_y
+            origin_x = 20
+            origin_y = 20
+            aligned_x = round((raw_x - origin_x) / grid_x) * grid_x + origin_x
+            aligned_y = round((raw_y - origin_y) / grid_y) * grid_y + origin_y
+            new_x = max(0, min(aligned_x, max_x))
+            new_y = max(0, min(aligned_y, max_y))
+
+            if (new_x, new_y) != btn._last_drag_pos:
+                btn._last_drag_pos = (new_x, new_y)
+                btn.place(x=new_x, y=new_y)
+
+    def _on_icon_release(self, event, icon_id, btn):
+        self._hide_delete_buttons()
+        if icon_id not in self.desktop_icons:
+            return
+
+        # 取消长按定时器
+        if hasattr(btn, "_press_timer") and btn._press_timer:
+            try:
+                btn.after_cancel(btn._press_timer)
+            except Exception:
+                pass
+            btn._press_timer = None
+
+        # 恢复默认样式
+        btn.configure(hover_color="#4a9eff", fg_color="transparent")
+
+        # 处理长按：显示删除按钮
+        if getattr(btn, "_long_pressed", False) and not btn._is_dragging:
+            btn._long_pressed = False
+            self._show_delete_button(btn, icon_id)
+            return
+
+        # 处理拖拽结束
+        if btn._is_dragging:
+            btn._is_dragging = False
+            self._perform_snap_and_push(btn, icon_id)
+            return
+
+        # 正常单击/双击逻辑（保持你提供的逻辑不变）
+        now = time.time()
+        if btn._last_click_time is None:
+            btn._last_click_time = now
+            btn._click_count = 1
+
+            def delayed_open():
+                if btn._click_count == 1:
+                    info = self.desktop_icons.get(icon_id)
+                    if info and info.get("command"):
+                        info["command"]()
+                btn._click_after_id = None
+                btn._last_click_time = None
+                btn._click_count = 0
+
+            btn._click_after_id = btn.after(500, delayed_open)
+            return
+        else:
+            elapsed = now - btn._last_click_time
+            if elapsed < 0.5:  # 双击
+                if hasattr(btn, "_click_after_id") and btn._click_after_id:
+                    try:
+                        btn.after_cancel(btn._click_after_id)
+                    except Exception:
+                        pass
+                    btn._click_after_id = None
+                btn._last_click_time = None
+                btn._click_count = 0
+                self._rename_icon(event, icon_id, btn)  # 双击重命名
+                return
+            else:
+                # 视为新单击
+                btn._last_click_time = now
+                btn._click_count = 1
+
+                def delayed_open2():
+                    if btn._click_count == 1:
+                        info = self.desktop_icons.get(icon_id)
+                        if info and info.get("command"):
+                            info["command"]()
+                    btn._click_after_id = None
+                    btn._last_click_time = None
+                    btn._click_count = 0
+
+                btn._click_after_id = btn.after(500, delayed_open2)
+                return
+            
+    def _rename_icon(self, event, icon_id, btn):
+        if icon_id not in self.desktop_icons:
+            return
+        info = self.desktop_icons[icon_id]
+        old_name = info["name"]
+        cur_x = btn.winfo_x()
+        cur_y = btn.winfo_y()
+        btn.place_forget()
+        entry = tk.Entry(
+            self.icon_frame,
+            font=("Arial", self.icon_font_size),
+            bg="#2b2b2b",
+            fg="white",
+            insertbackground="white",
+            relief="flat",
+            width=max(10, len(old_name) + 2),
+        )
+        entry.place(x=cur_x, y=cur_y, width=self.icon_size, height=self.icon_size)
+        entry.insert(0, old_name)
+        entry.select_range(0, tk.END)
+        entry.focus_force()
+        entry.icursor(tk.END)
+
+        def finish(ok=True):
+            new_name = entry.get().strip() if ok else old_name
+            if not new_name:
+                new_name = old_name
+            icon_symbol = btn.cget("text").split("\n")[0]
+            btn.configure(text=f"{icon_symbol}\n{new_name}")
+            info["name"] = new_name
+            # 恢复位置，并再次对齐网格
+            btn.place(x=cur_x, y=cur_y)
+            self._perform_snap_and_push(btn, icon_id)  # 强制吸附到网格
+            entry.destroy()
+            self._save_dynamic_icons()
+
+        entry.bind("<Return>", lambda e: finish(True))
+        entry.bind("<FocusOut>", lambda e: finish(False))
+        self.bind_all("<Button-1>", lambda e: finish(False) if entry.winfo_exists() else None)
 
     def _cancel_press_timer(self, btn):
         """取消长按计时器"""
@@ -26020,102 +26696,6 @@ class KIKIGUI(ctk.CTk):
         # 同时输出到原始控制台，方便观察
         sys.__stdout__.write(f"[KIKI-DEBUG] {msg}\n")
         sys.__stdout__.flush()
-
-    def _add_desktop_icon(self, target_path, display_name=None, x=None, y=None):
-        if not target_path:
-            return None
-        if display_name is None:
-            display_name = os.path.basename(target_path)
-            if not display_name:
-                display_name = "快捷方式"
-
-        for icon_id, info in self.desktop_icons.items():
-            if info.get("path") == target_path:
-                return info["widget"]
-
-        node = self.shell.fs.resolve(target_path, self.username)
-        if node is None:
-            icon_symbol = "❓"
-        elif isinstance(node, Directory):
-            icon_symbol = "📁"
-        else:
-            ext = os.path.splitext(display_name)[1].lower()
-            icon_map = {
-                ".py": "📜",
-                ".sh": "📜",
-                ".bat": "📜",
-                ".jpg": "🖼️",
-                ".png": "🖼️",
-                ".gif": "🖼️",
-                ".mp3": "🎵",
-                ".wav": "🎵",
-                ".mp4": "🎬",
-                ".avi": "🎬",
-                ".zip": "📦",
-                ".rar": "📦",
-            }
-            icon_symbol = icon_map.get(ext, "📄")
-
-        btn = ctk.CTkButton(
-            self.icon_frame,
-            text=f"{icon_symbol}\n{display_name}",
-            width=self.icon_size,
-            height=self.icon_size,
-            command=None,
-            font=("Arial", self.icon_font_size),
-            fg_color="transparent",
-            hover_color="#404040",
-        )
-
-        if x is None or y is None:
-            dynamic_list = self.shell.config.config.get("desktop", {}).get("dynamic_icons", [])
-            found = False
-            for item in dynamic_list:
-                if item.get("path") == target_path:
-                    x = item.get("x")
-                    y = item.get("y")
-                    found = True
-                    break
-            if not found:
-                max_y = 20
-                for info in self.desktop_icons.values():
-                    w = info.get("widget")
-                    if w and w.winfo_exists():
-                        wy = w.winfo_y()
-                        max_y = max(max_y, wy)
-                x, y = 20, max_y + 90
-            if x is None or y is None:
-                x, y = 20, 20
-
-        self._log_debug(f"[ADD-DEBUG] 创建图标 {display_name}, 传入坐标: ({x}, {y})")
-
-        # 边界检查：只拒绝负数，不检查最大值，避免误判导致位置重置
-        if x < 0:
-            x = 20
-        if y < 0:
-            y = 20
-        # 不再强制限制最大值，因为屏幕高度未知，只要非负即可
-
-        icon_id = f"dynamic_{self.dynamic_icon_counter}"
-        self.dynamic_icon_counter += 1
-
-        btn.place(x=x, y=y)
-        btn.bind("<Button-1>", lambda e, iid=icon_id, b=btn: self._on_icon_press(e, iid, b))
-        btn.bind("<B1-Motion>", lambda e, iid=icon_id, b=btn: self._on_icon_drag(e, iid, b))
-        btn.bind(
-            "<ButtonRelease-1>",
-            lambda e, iid=icon_id, b=btn: self._on_icon_release(e, iid, b),
-        )
-
-        self.desktop_icons[icon_id] = {
-            "widget": btn,
-            "name": display_name,
-            "path": target_path,
-            "is_dynamic": True,
-        }
-        self.desktop_icon_positions[icon_id] = (x, y)
-        self._save_dynamic_icons()
-        return btn
 
     def _restore_dynamic_icons(self):
         if not self.username:
@@ -26389,21 +26969,6 @@ class KIKIGUI(ctk.CTk):
                 os.path.basename(target_path),
                 content[:2000] + ("..." if len(content) > 2000 else ""),
             )
-
-    def _desktop_icon_right_click(self, event, target_path, btn):
-        """桌面图标右键菜单"""
-        menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="打开", command=lambda: self._open_desktop_icon(target_path))
-        menu.add_command(
-            label="删除快捷方式",
-            command=lambda: self._remove_desktop_icon_by_path(target_path),
-        )
-        menu.add_separator()
-        menu.add_command(
-            label="属性",
-            command=lambda: messagebox.showinfo("属性", f"目标: {target_path}"),
-        )
-        menu.post(event.x_root, event.y_root)
 
     def _remove_desktop_icon_by_path(self, target_path):
         """根据路径删除动态图标"""
@@ -27316,19 +27881,18 @@ class KIKIGUI(ctk.CTk):
             self.vol_btn.configure(text=icon)
 
     def _on_tray_click(self, event):
-        # 如果菜单窗口已存在，则触发收缩关闭
-        if hasattr(self, "_menu_window") and self._menu_window.winfo_exists():
-            # 如果正在收缩动画，则直接销毁并重新弹出（快速双击）
+        # 修复：先检查 _menu_window 是否为 None，再调用 winfo_exists()
+        if self._menu_window is not None and self._menu_window.winfo_exists():
+            # 如果窗口正在收缩动画，直接销毁并重新弹出
             if hasattr(self, "_menu_animating") and self._menu_animating:
                 self._menu_window.destroy()
                 self._menu_animating = False
-                if hasattr(self, "_menu_window"):
-                    delattr(self, "_menu_window")
+                self._menu_window = None
             else:
                 self._close_menu_window(self._menu_window)
                 return
 
-        # === 创建新的菜单窗口（原有代码） ===
+        # === 创建新的菜单窗口 ===
         menu_win = ctk.CTkToplevel(self)
         menu_win.overrideredirect(True)
         menu_win.attributes("-alpha", 0.0)
@@ -27340,7 +27904,6 @@ class KIKIGUI(ctk.CTk):
         btn_x = self.tray_btn.winfo_rootx()
         btn_y = self.tray_btn.winfo_rooty()
         btn_w = self.tray_btn.winfo_width()
-        self.tray_btn.winfo_height()
         x = btn_x + (btn_w - target_width) // 2
         y = btn_y - target_height - 10
         if y < 0:
@@ -27384,7 +27947,7 @@ class KIKIGUI(ctk.CTk):
         ).pack(fill="x", padx=5, pady=(5, 10))
 
         self._menu_window = menu_win
-        self._menu_animating = False  # 重置动画标志
+        self._menu_animating = False
 
         # 启动弹出动画
         self._animate_menu(menu_win)
@@ -28637,6 +29200,15 @@ class KIKIGUI(ctk.CTk):
                     "<Button-3>",
                     lambda e, w=item["window"], b=btn: self._show_dock_window_menu(e, w, b),
                 )
+                # ---------- 直接显示预览（无延迟） ----------
+                btn.bind(
+                    "<Enter>",
+                    lambda e, w=item["window"], b=btn: self._show_taskbar_preview(e, w, b)
+                )
+                btn.bind(
+                    "<Leave>",
+                    lambda e: self._schedule_hide_taskbar_preview()
+                )
             else:
                 btn.configure(
                     command=lambda t=item["win_type"], d=item["data"]: self._open_pinned_window(
@@ -28653,6 +29225,195 @@ class KIKIGUI(ctk.CTk):
         # ---- 执行两次刷新，确保物理渲染 ----
         self.dock.update_idletasks()
         self.dock_left.update_idletasks()
+
+    def _show_taskbar_preview(self, event, window, btn):
+        """鼠标悬停在任务栏按钮上时，显示窗口预览缩略图"""
+        if not self.winfo_exists() or getattr(self, "_closing", False):
+            return
+        if window is None or not window.winfo_exists():
+            return
+
+        # 取消之前的隐藏计划
+        self._cancel_hide_preview()
+
+        # 创建或复用预览窗口
+        if not hasattr(self, "_taskbar_preview_win") or self._taskbar_preview_win is None or not self._taskbar_preview_win.winfo_exists():
+            self._taskbar_preview_win = ctk.CTkToplevel(self)
+            self._taskbar_preview_win.overrideredirect(True)
+            self._taskbar_preview_win.attributes("-topmost", True)
+            self._taskbar_preview_win.attributes("-alpha", 0.95)
+            self._taskbar_preview_label = ctk.CTkLabel(self._taskbar_preview_win, text="")
+            self._taskbar_preview_label.pack(fill="both", expand=True)
+        else:
+            self._taskbar_preview_win.deiconify()
+
+        # 窗口不可见（最小化/隐藏）时直接显示标题
+        if not window.winfo_ismapped():
+            self._taskbar_preview_label.configure(text=window.title(), image="")
+            self._taskbar_preview_win.geometry(f"200x50+{btn.winfo_rootx()}+{btn.winfo_rooty() - 60}")
+            self._taskbar_preview_win.lift()
+            return
+
+        # 尝试 PrintWindow 捕获窗口自身内容（仅 Windows 有效）
+        img = self._capture_window_via_printwindow(window)
+
+        # 如果失败，显示窗口标题
+        if img is None:
+            self._taskbar_preview_label.configure(text=window.title(), image="")
+            self._taskbar_preview_win.geometry(f"200x50+{btn.winfo_rootx()}+{btn.winfo_rooty() - 60}")
+            self._taskbar_preview_win.lift()
+            return
+
+        # 缩放并显示
+        w, h = window.winfo_width(), window.winfo_height()
+        max_w, max_h = 300, 200
+        ratio = min(max_w / w, max_h / h, 1.0)
+        new_w = int(w * ratio)
+        new_h = int(h * ratio)
+        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+        # 转换为 CTkImage（支持高 DPI）
+        ctk_image = ctk.CTkImage(light_image=img, dark_image=img, size=(new_w, new_h))
+        self._taskbar_preview_label.configure(image=ctk_image, text="")
+        self._taskbar_preview_label.image = ctk_image
+
+        # 定位预览窗口（在按钮上方）
+        btn_x = btn.winfo_rootx()
+        btn_y = btn.winfo_rooty()
+        preview_x = btn_x + (btn.winfo_width() - new_w) // 2
+        preview_y = btn_y - new_h - 8
+        if preview_y < 0:
+            preview_y = 0
+        self._taskbar_preview_win.geometry(f"{new_w}x{new_h}+{preview_x}+{preview_y}")
+        self._taskbar_preview_win.lift()
+
+        # 绑定预览窗口的 Enter/Leave 事件，防止闪烁
+        self._taskbar_preview_win.bind("<Enter>", lambda e: self._cancel_hide_preview())
+        self._taskbar_preview_win.bind("<Leave>", lambda e: self._schedule_hide_taskbar_preview())
+
+    def _schedule_hide_taskbar_preview(self):
+        """延迟隐藏预览，避免鼠标快速移动时闪烁"""
+        # 先取消之前的隐藏计划
+        self._cancel_hide_preview()
+        # 设置新的延迟隐藏
+        self._hide_preview_after_id = self.after(400, self._hide_taskbar_preview)
+
+    def _cancel_hide_preview(self):
+        """取消待执行的隐藏计划"""
+        if hasattr(self, "_hide_preview_after_id") and self._hide_preview_after_id:
+            try:
+                self.after_cancel(self._hide_preview_after_id)
+            except Exception:
+                pass
+            self._hide_preview_after_id = None
+
+    def _hide_taskbar_preview(self):
+        """真正隐藏预览"""
+        # 取消隐藏计划
+        self._cancel_hide_preview()
+        if hasattr(self, "_taskbar_preview_win") and self._taskbar_preview_win is not None and self._taskbar_preview_win.winfo_exists():
+            self._taskbar_preview_win.withdraw()
+
+    def _capture_window_via_printwindow(self, window):
+        """使用 PrintWindow 捕获窗口自身内容（仅 Windows）"""
+        if sys.platform != "win32":
+            return None
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+            from PIL import Image
+
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+
+            hwnd = window.winfo_id()
+            GA_ROOT = 2
+            root_hwnd = user32.GetAncestor(hwnd, GA_ROOT)
+            if not root_hwnd:
+                root_hwnd = hwnd
+
+            rect = wintypes.RECT()
+            if not user32.GetWindowRect(root_hwnd, ctypes.byref(rect)):
+                return None
+            width = rect.right - rect.left
+            height = rect.bottom - rect.top
+            if width <= 0 or height <= 0:
+                return None
+
+            hdc_window = user32.GetWindowDC(root_hwnd)
+            if not hdc_window:
+                return None
+            hdc_mem = gdi32.CreateCompatibleDC(hdc_window)
+            if not hdc_mem:
+                user32.ReleaseDC(root_hwnd, hdc_window)
+                return None
+            hbm = gdi32.CreateCompatibleBitmap(hdc_window, width, height)
+            if not hbm:
+                gdi32.DeleteDC(hdc_mem)
+                user32.ReleaseDC(root_hwnd, hdc_window)
+                return None
+            old_obj = gdi32.SelectObject(hdc_mem, hbm)
+
+            # 调用 PrintWindow，先尝试普通模式 (0)，再尝试 PW_RENDERFULLCONTENT (2)
+            if user32.PrintWindow(root_hwnd, hdc_mem, 0) == 0:
+                if user32.PrintWindow(root_hwnd, hdc_mem, 2) == 0:
+                    gdi32.SelectObject(hdc_mem, old_obj)
+                    gdi32.DeleteObject(hbm)
+                    gdi32.DeleteDC(hdc_mem)
+                    user32.ReleaseDC(root_hwnd, hdc_window)
+                    return None
+
+            # 构造 BITMAPINFO 结构并提取像素
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [
+                    ("biSize", wintypes.DWORD),
+                    ("biWidth", wintypes.LONG),
+                    ("biHeight", wintypes.LONG),
+                    ("biPlanes", wintypes.WORD),
+                    ("biBitCount", wintypes.WORD),
+                    ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD),
+                    ("biXPelsPerMeter", wintypes.LONG),
+                    ("biYPelsPerMeter", wintypes.LONG),
+                    ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD),
+                ]
+
+            class BITMAPINFO(ctypes.Structure):
+                _fields_ = [
+                    ("bmiHeader", BITMAPINFOHEADER),
+                    ("bmiColors", wintypes.DWORD * 3),
+                ]
+
+            bi = BITMAPINFO()
+            bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bi.bmiHeader.biWidth = width
+            bi.bmiHeader.biHeight = -height  # 负值表示自顶向下
+            bi.bmiHeader.biPlanes = 1
+            bi.bmiHeader.biBitCount = 32
+            bi.bmiHeader.biCompression = 0  # BI_RGB
+
+            buffer = ctypes.create_string_buffer(width * height * 4)
+            if gdi32.GetDIBits(hdc_mem, hbm, 0, height, buffer, ctypes.byref(bi), 0) == 0:
+                gdi32.SelectObject(hdc_mem, old_obj)
+                gdi32.DeleteObject(hbm)
+                gdi32.DeleteDC(hdc_mem)
+                user32.ReleaseDC(root_hwnd, hdc_window)
+                return None
+
+            img = Image.frombuffer("RGBA", (width, height), buffer.raw, "raw", "BGRA", 0, 1)
+            img = img.convert("RGB")
+
+            # 清理
+            gdi32.SelectObject(hdc_mem, old_obj)
+            gdi32.DeleteObject(hbm)
+            gdi32.DeleteDC(hdc_mem)
+            user32.ReleaseDC(root_hwnd, hdc_window)
+
+            return img
+        except Exception:
+            return None
 
     def _dock_item_hover(self, btn, enter):
         """鼠标悬停 Dock 图标（强制终结旧动画 + 防抖）"""
@@ -28803,11 +29564,15 @@ class KIKIGUI(ctk.CTk):
         return labels.get(win_type, win_type)
 
     def _open_pinned_window(self, win_type, data):
-        """打开固定的窗口"""
+        """打开固定的窗口或命令"""
         if win_type == "command":
-            # 直接执行命令
-            self.shell._execute(data)
+            # 执行命令（data 是命令名或类名）
+            if data:
+                self.shell._execute(data)
+            else:
+                self._show_notification("无效命令")
             return
+
         if win_type == "filemanager":
             self._open_fm_at(data if data else "/")
         elif win_type == "texteditor":
@@ -28835,6 +29600,30 @@ class KIKIGUI(ctk.CTk):
             self._add_widget("sysmon")
         elif win_type == "sticky":
             self._new_sticky_note()
+        elif win_type == "terminal":
+            # 优先聚焦现有终端窗口，否则打开新的悬浮终端
+            if hasattr(self, "terminal_window") and self.terminal_window and self.terminal_window.winfo_exists():
+                self.terminal_window.lift()
+                self.terminal_window.focus_force()
+            else:
+                self._open_floating_terminal()
+        elif win_type == "task_manager":
+            self._open_task_manager()
+        elif win_type == "audit_log":
+            self._open_audit_log()
+        elif win_type == "workspace":
+            self._open_workspace()
+        elif win_type == "browser":
+            # 兼容旧类型：browser 与 webbrowser 相同
+            win = QtTabBrowserWindow(self, data if data else "https://www.google.com")
+            self._add_window(win)
+        else:
+            # 处理未知类型（第三方窗口等）：尝试根据类名打开，或提示无法打开
+            if data:
+                # 若 data 是类名，尝试动态实例化？这里简单处理：提示
+                self._show_notification(f"无法直接打开窗口类型: {win_type} (data={data})")
+            else:
+                self._show_notification("无法识别的窗口类型，无法打开。")
         self._update_dock()
 
     def _show_pinned_menu(self, event, win_type, data):
@@ -28863,6 +29652,7 @@ class KIKIGUI(ctk.CTk):
 
     def _get_window_type(self, window):
         """获取窗口类型标识，用于固定"""
+        # 显式类型检测（原有序）
         if isinstance(window, WorkspaceManager):
             return ("workspace_manager", None)
         if isinstance(window, FileManager):
@@ -28892,11 +29682,49 @@ class KIKIGUI(ctk.CTk):
             return ("sysmon", None)
         elif isinstance(window, StickyNote):
             return ("sticky", None)
-        # 第三方应用：通过 app_name 属性识别
-        elif hasattr(window, "app_name") and window.app_name:
-            return ("command", window.app_name)
+        # 新增：终端模拟器（可能是 KikiWindow 子类）
+        elif hasattr(window, "terminal_window") or window.__class__.__name__ == "KikiWindow":
+            return ("terminal", None)
+        # 新增：通用 CTk 窗口或 KikiWindow 子类
+        elif isinstance(window, KikiWindow):
+            # 尝试根据标题匹配常见窗口
+            title = window.title().lower()
+            if "终端" in title or "terminal" in title:
+                return ("terminal", None)
+            elif "文件" in title or "file" in title:
+                return ("filemanager", "/")
+            elif "设置" in title or "settings" in title:
+                return ("settings", None)
+            elif "计算器" in title or "calculator" in title:
+                return ("calculator", None)
+            elif "ai" in title or "助手" in title:
+                return ("aichat", None)
+            elif "浏览器" in title or "browser" in title:
+                return ("webbrowser", "https://www.bing.com")
+            elif "编辑器" in title or "编辑" in title:
+                return ("texteditor", None)
+            elif "画图" in title or "paint" in title:
+                return ("paint", None)
+            elif "便签" in title or "sticky" in title:
+                return ("sticky", None)
+            elif "lisp" in title.lower():
+                return ("lisp", None)
+            elif "python" in title.lower():
+                return ("python", None)
+            elif "系统监控" in title:
+                return ("systemmonitor", None)
+            elif "任务管理" in title:
+                return ("task_manager", None)
+            else:
+                # 最后兜底：返回类名（不会为 None）
+                return (None, window.__class__.__name__)
         else:
-            return (None, None)
+            # 普通 tkinter 窗口：尝试通过类名判断
+            class_name = window.__class__.__name__
+            if class_name in ("TerminalWindow", "Terminal"):
+                return ("terminal", None)
+            else:
+                return (None, class_name)
 
     def _show_taskbar_menu(self, event, window):
         """任务栏按钮右键菜单"""
@@ -28974,35 +29802,70 @@ class KIKIGUI(ctk.CTk):
         # 方法1：通过 _get_window_type 识别
         win_type, data = self._get_window_type(window)
 
-        # 方法2：直接尝试从窗口获取 app_name
+        # 方法2：如果方法1未识别，尝试直接获取 app_name 属性
         if not win_type:
             cmd = getattr(window, "app_name", None)
             if cmd:
                 win_type, data = "command", cmd
             else:
-                # 方法3：从标题解析（针对特定应用）
-                title = window.title()
-                if title.startswith("KIKI OS 自制应用"):
-                    win_type, data = "command", "my_sysinfo"
+                # 方法3：使用 data（类名）作为 command 类型
+                if data:
+                    win_type, data = "command", data
                 else:
-                    self._show_notification("无法识别该窗口，请使用 'pin <命令>' 手动固定")
-                    return
+                    # 方法4：从标题解析（虽然 _get_window_type 已尝试过，但防止遗漏）
+                    title = window.title().lower()
+                    if "终端" in title:
+                        win_type, data = "terminal", None
+                    elif "浏览器" in title:
+                        win_type, data = "webbrowser", None
+                    elif "ai" in title:
+                        win_type, data = "aichat", None
+                    elif "设置" in title:
+                        win_type, data = "settings", None
+                    elif "计算器" in title:
+                        win_type, data = "calculator", None
+                    elif "编辑器" in title:
+                        win_type, data = "texteditor", None
+                    elif "文件" in title:
+                        win_type, data = "filemanager", "/"
+                    else:
+                        # 全部失败，提示无法识别
+                        self._show_notification("无法识别该窗口，请使用 'pin <命令>' 手动固定")
+                        return
 
         # 构建固定键
         key = (win_type, data)
         if not hasattr(self, "pinned_items"):
             self.pinned_items = []
 
+        # 获取显示名称（用于提示）
+        if data:
+            display_name = data
+        elif hasattr(window, "title"):
+            display_name = window.title()
+        else:
+            display_name = "窗口"
+
         # 切换固定状态
         if key in self.pinned_items:
             self.pinned_items.remove(key)
-            self._show_notification(f"已取消固定: {data}")
+            self._show_notification(f"已取消固定: {display_name}")
         else:
             self.pinned_items.append(key)
-            self._show_notification(f"已固定: {data}")
+            self._show_notification(f"已固定: {display_name}")
 
-        self._save_pinned_items()
-        self._update_dock()
+    def _hide_taskbar_preview(self):
+        """隐藏预览"""
+        # 取消防抖定时器，防止延迟显示
+        if hasattr(self, "_preview_after_id") and self._preview_after_id:
+            try:
+                self.after_cancel(self._preview_after_id)
+            except Exception:
+                pass
+            self._preview_after_id = None
+        # 隐藏预览窗口
+        if hasattr(self, "_taskbar_preview_win") and self._taskbar_preview_win is not None and self._taskbar_preview_win.winfo_exists():
+            self._taskbar_preview_win.withdraw()
 
     def _save_pinned_items(self):
         """保存固定列表到配置"""
@@ -29517,7 +30380,7 @@ class PythonREPL(KikiWindow):
         output_queue = multiprocessing.Queue()
         p = multiprocessing.Process(target=_repl_sandbox_target, args=(code, output_queue))
         p.start()
-        p.join(timeout=10)
+        p.join(timeout=60)
 
         output = ""
         error = ""
@@ -31106,6 +31969,7 @@ class AIChatWindow(KikiWindow):
         self.gui = master
         self.shell = shell
         self.ai_engine = shell.ai_engine
+        self.ai_engine._popup_parent = self
         self.ai_engine.reply_callback = self._show_ai_reply
         self.ai_engine.thinking_callback = self._show_thinking
 
@@ -31139,11 +32003,17 @@ class AIChatWindow(KikiWindow):
 
         self.speak_enabled = False
         self.refresh_model()
+        # 初始化后自动询问是否启用在线模型（若已发现但未决定）
+        if self.ai_engine._model_user_choice is None:
+            self.ai_engine._try_enable_model_sync()
         self.chat_display.insert("end", "欢迎使用 AI 助手（已整合思考与工具）！\n")
         self.chat_display.configure(state="disabled")
 
     def refresh_model(self):
         self.ai_engine.detect_local_ollama()
+        # 如果检测到模型但用户还没选择，弹出询问
+        if self.ai_engine._model_user_choice is None and self.ai_engine.available_models:
+            self.ai_engine._try_enable_model_sync()
         status, model = self.ai_engine.get_status()
         self.status_label.configure(text=f"状态: {status} | 模型: {model}")
 
@@ -31167,6 +32037,11 @@ class AIChatWindow(KikiWindow):
         self.chat_display.configure(state="normal")
         self.chat_display.insert("end", f"👤 您: {text}\n")
         self.chat_display.configure(state="disabled")
+
+        # 确保模型选择已完成（弹窗询问）
+        if self.ai_engine.provider is None and self.ai_engine._model_user_choice is None:
+            self.ai_engine._try_enable_model_sync()
+
         self.ai_engine.chat(text)
 
     def _show_thinking(self, thinking):
