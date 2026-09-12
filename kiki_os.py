@@ -9025,75 +9025,25 @@ class Pet:
         if not shell.voice:
             self.show_bubble("语音助手未初始化")
             return
+
         self.last_interact = time.time()
+        self.show_bubble("🎤 请说话...")
 
-        self.show_bubble("请说话...")
-        try:
+        text = shell.voice.listen()
+        if not text:
             from tkinter import simpledialog
+            text = simpledialog.askstring("语音识别失败", "请手动输入指令:", parent=self.master)
+        if not text:
+            self.show_bubble("未输入指令")
+            return
 
-            text = shell.voice.listen()
-            if not text:
-                text = simpledialog.askstring(
-                    "语音识别失败", "请手动输入您的指令:", parent=self.master
-                )
-                if not text:
-                    self.show_bubble("未输入指令")
-                    return
+        self.show_bubble(f"👤 {text}")
 
-            import re
+        def on_reply(reply, emoji="🤖"):
+            short = reply if len(reply) <= 80 else reply[:80] + "…"
+            self.show_bubble(f"{emoji} {short}")
 
-            # === 修正后的意图映射：所有 handler 都接收 *args 来处理捕获组 ===
-            INTENT_PATTERNS = {
-                # === 系统/应用控制 ===
-                r"打开\s*(文件管理器|资源管理器|fm|我的电脑|此电脑)": lambda s, *args: s.master._open_fm(),
-                r"打开\s*终端|终端": lambda s, *args: s.master._focus_terminal(),
-                r"打开\s*设置|设置": lambda s, *args: s.master._open_settings(),
-                r"打开\s*回收站|回收站": lambda s, *args: s.master._open_trash(),
-                r"打开\s*文档|文档": lambda s, *args: s.master._open_documents(),
-                r"打开\s*计算器|计算器": lambda s, *args: s.master._open_calc(),
-                r"打开\s*文本编辑器|文本编辑器": lambda s, *args: s.master._open_editor(),
-                r"打开\s*工作区|工作区": lambda s, *args: s.master._open_workspace(),
-                r"打开\s*任务管理器|任务管理器": lambda s, *args: s.master._open_task_manager(),
-                # === 截图 ===
-                r"截图|截屏": lambda s, *args: s.master._screenshot_full(),
-                r"区域截图": lambda s, *args: s.master._screenshot_area(),
-                # === 系统命令 ===
-                r"(?:关机|关闭系统)": lambda s, *args: shell._execute("shutdown"),
-                r"(?:重启|重新启动)": lambda s, *args: shell._execute("reboot"),
-                r"(?:刷新|重新加载)": lambda s, *args: shell._execute("reload"),
-                # === 文件操作（提取变量） ===
-                r"列出\s*(?:当前)?\s*(?:目录|文件夹)": lambda s, *args: shell._execute("dir"),
-                r"新建\s*文件夹\s*([\w\-\_]+)": lambda s, *args: (
-                    shell._execute(f"mkdir {args[0]}") if args else None
-                ),
-            }
-
-            matched = False
-            for pattern, handler in INTENT_PATTERNS.items():
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    # 统一用 *args 传递捕获组，避免参数个数不匹配
-                    handler(self, *match.groups())
-                    matched = True
-                    self.show_bubble(f"执行: {text}")
-                    break
-
-            if not matched:
-                shell._execute(text)
-                self.show_bubble(f"执行命令: {text}")
-
-        except Exception as e:
-            print(f"语音识别异常: {e}")
-            from tkinter import simpledialog
-
-            manual = simpledialog.askstring(
-                "语音识别异常", "请手动输入您的指令:", parent=self.master
-            )
-            if manual:
-                shell._execute(manual)
-                self.show_bubble(f"执行: {manual}")
-            else:
-                self.show_bubble("未输入指令")
+        shell.ai_engine.ask_voice(text, on_reply)
 
     def react_to_event(self, event_type):
         if not self._running:
@@ -13136,6 +13086,46 @@ class UnifiedAIEngine:
             error_msg = f"AI 请求失败: {e}"
             self._emit_reply(error_msg, "❌")
 
+    def ask_voice(self, text, callback):
+        """语音模式：后台执行 AI，结果通过 callback(reply, emoji) 返回主线程"""
+        import threading
+
+        def work():
+            try:
+                if self.provider == "ollama":
+                    reply = self._query_ollama(self.model, [{"role": "user", "content": text}])
+                elif self.provider and HAS_LITELLM:
+                    reply = self._query_litellm(self.provider, self.model, [{"role": "user", "content": text}])
+                else:
+                    reply, emoji = self._offline_reply(text)
+                    self.shell.gui_app.after(0, lambda: callback(reply, emoji))
+                    return
+
+                thinking = self.extract_thinking(reply)
+                if thinking:
+                    reply = self.remove_thinking(reply)
+
+                actions = self.parse_tool_calls(reply)
+                if actions:
+                    if self.reply_callback:
+                        self.shell._ai_output_target = "chat"
+                        self.shell._ai_chat_callback = lambda msg: self._emit_reply(msg, "🔧")
+                    else:
+                        self.shell._ai_output_target = "terminal"
+                        self.shell._ai_chat_callback = None
+                    try:
+                        self.shell._execute_ai_actions(actions)
+                    finally:
+                        self.shell._ai_output_target = "terminal"
+                        self.shell._ai_chat_callback = None
+                    reply = "✅ 已根据您的指令完成操作。"
+
+                self.shell.gui_app.after(0, lambda: callback(reply, "🤖"))
+            except Exception as e:
+                self.shell.gui_app.after(0, lambda: callback(f"AI 错误: {e}", "❌"))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _is_complex_multi_step(self, text):
         """判断是否为复杂多步骤指令"""
         action_keywords = [
@@ -14129,6 +14119,22 @@ class KIKIShell:
         "enum", "dataclasses", "typing", "abc", "queue",
         "io", "pathlib", "hashlib", "hmac", "base64", "decimal",
         "fractions", "statistics", "platform", "sys", "subprocess"
+    }
+    CATEGORY_LABELS = {
+        "files": "文件管理",
+        "system": "系统信息",
+        "net": "网络命令",
+        "game": "游戏娱乐",
+        "user": "用户管理",
+        "admin": "用户管理",
+        "program": "程序开发",
+        "tools": "实用工具",
+        "gui": "图形界面",
+        "plugin": "插件",
+        "general": "常规",
+        "social": "社交",
+        "ipc": "进程通信",
+        "misc": "其他",
     }
 
     # ===== 新增：长期记忆管理器（嵌套类） =====
@@ -16538,9 +16544,9 @@ def register(api):
 
     @command("help", "general", "cmd_help")
     def help(self, args, src=None):
-        # 直接输出到终端（绕过 print 和 rich）
+        """显示帮助信息"""
         def out(text):
-            if hasattr(self, "gui_app") and hasattr(self.gui_app, "term"):
+            if hasattr(self, "gui_app") and self.gui_app and hasattr(self.gui_app, "term"):
                 try:
                     self.gui_app.term.configure(state="normal")
                     self.gui_app.term.insert("end", text)
@@ -16552,6 +16558,7 @@ def register(api):
             else:
                 print(text)
 
+        # 帮助单个命令
         if args:
             cmd = args.strip()
             if cmd in self.COMMANDS:
@@ -16560,115 +16567,32 @@ def register(api):
                 out(_("no_help", cmd) + "\n")
             return
 
-        # 构建类别
-        categories = {
-            "文件管理": [],
-            "系统信息": [],
-            "网络命令": [],
-            "游戏娱乐": [],
-            "用户管理": [],
-            "程序开发": [],
-            "其他工具": [],
-        }
-        cat_map = {
-            "dir": "文件管理",
-            "ls": "文件管理",
-            "cd": "文件管理",
-            "pwd": "文件管理",
-            "mkdir": "文件管理",
-            "rmdir": "文件管理",
-            "del": "文件管理",
-            "rm": "文件管理",
-            "type": "文件管理",
-            "cat": "文件管理",
-            "edit": "文件管理",
-            "copy": "文件管理",
-            "cp": "文件管理",
-            "move": "文件管理",
-            "mv": "文件管理",
-            "find": "文件管理",
-            "grep": "文件管理",
-            "sort": "文件管理",
-            "tree": "文件管理",
-            "trash": "文件管理",
-            "emptytrash": "文件管理",
-            "undelete": "文件管理",
-            "xcopy": "文件管理",
-            "chmod": "文件管理",
-            "chown": "文件管理",
-            "attrib": "文件管理",
-            "fc": "文件管理",
-            "join": "文件管理",
-            "ver": "系统信息",
-            "date": "系统信息",
-            "time": "系统信息",
-            "uptime": "系统信息",
-            "ps": "系统信息",
-            "kill": "系统信息",
-            "reboot": "系统信息",
-            "shutdown": "系统信息",
-            "uname": "系统信息",
-            "df": "系统信息",
-            "du": "系统信息",
-            "mem": "系统信息",
-            "chkdsk": "系统信息",
-            "label": "系统信息",
-            "settings": "系统信息",
-            "history": "系统信息",
-            "alias": "系统信息",
-            "ping": "网络命令",
-            "ifconfig": "网络命令",
-            "netstat": "网络命令",
-            "httpd": "网络命令",
-            "snake": "游戏娱乐",
-            "minesweeper": "游戏娱乐",
-            "tetris": "游戏娱乐",
-            "game2048": "游戏娱乐",
-            "matrix": "游戏娱乐",
-            "fortune": "游戏娱乐",
-            "register": "用户管理",
-            "passwd": "用户管理",
-            "users": "用户管理",
-            "su": "用户管理",
-            "whoami": "用户管理",
-            "basic": "程序开发",
-            "python": "程序开发",
-            "lisp": "程序开发",
-            "echo": "其他工具",
-            "cls": "其他工具",
-            "clear": "其他工具",
-            "calc": "其他工具",
-            "sleep": "其他工具",
-            "more": "其他工具",
-            "tail": "其他工具",
-            "head": "其他工具",
-            "which": "其他工具",
-            "whereis": "其他工具",
-            "jobs": "其他工具",
-            "fg": "其他工具",
-            "bg": "其他工具",
-            "nohup": "其他工具",
-            "set": "其他工具",
-            "export": "其他工具",
-            "env": "其他工具",
-            "ai": "其他工具",
-            "store": "其他工具",
-            "workspace": "其他工具",
-            "kiki": "其他工具",
-        }
-
+        # 按装饰器的 category 分组（同一中文标签合并）
+        groups = {}
         for cmd, (func, help_key, cat) in self.COMMANDS.items():
-            category = cat_map.get(cmd, "其他工具")
-            if category not in categories:
-                categories[category] = []
-            categories[category].append((cmd, _(help_key)))
+            label = self.CATEGORY_LABELS.get(cat, cat)
+            groups.setdefault(label, []).append((cmd, _(help_key)))
 
-        # 生成纯文本表格（手动对齐）
+        # 输出：按 CATEGORY_LABELS 的值顺序，且同一标签只输出一次
         out("\n")
-        for cat, cmds in categories.items():
+        seen_labels = set()
+        for label in self.CATEGORY_LABELS.values():
+            if label in seen_labels:
+                continue
+            seen_labels.add(label)
+            cmds = groups.get(label)
             if not cmds:
                 continue
-            out(f"=== {cat} ===\n")
+            out(f"=== {label} ===\n")
+            for cmd, desc in sorted(cmds):
+                out(f"  {cmd:<12} - {desc}\n")
+            out("\n")
+
+        # 兜底：装饰器里用了但 CATEGORY_LABELS 没定义的 category
+        for label, cmds in groups.items():
+            if label in seen_labels:
+                continue
+            out(f"=== {label} ===\n")
             for cmd, desc in sorted(cmds):
                 out(f"  {cmd:<12} - {desc}\n")
             out("\n")
@@ -17772,7 +17696,7 @@ def register(api):
         for p in self.proc.list_processes():
             print(f"{p['pid']:4d} {p['user']:7s} {p['name']:16s} {p['cpu']:5.1f} {p['mem']:5d}")
 
-    @command("kill", "admin", "cmd_kill")
+    @command("kill", "system", "cmd_kill")
     def kill_cmd(self, args, src=None):
         if not self._is_admin():
             print(_("permission_denied"))
