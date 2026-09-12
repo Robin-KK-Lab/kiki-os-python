@@ -28,12 +28,12 @@ import signal
 import socketserver
 import sqlite3
 import sys
-import types
 import tempfile
 import threading
 import time
 import tkinter as tk
 import traceback
+import types
 import webbrowser
 from collections import deque
 from contextlib import redirect_stderr, redirect_stdout
@@ -205,6 +205,91 @@ class DummyColor:
 PERSIST_FILE = os.path.join(KIKI_DATA_DIR, "kiki_data.dat")
 
 
+# ===== 动画辅助类 =====
+class Easing:
+    @staticmethod
+    def ease_out_cubic(t):
+        return 1 - (1 - t) ** 3
+
+    @staticmethod
+    def ease_in_cubic(t):
+        return t ** 3
+
+    @staticmethod
+    def ease_in_out_quad(t):
+        return 2 * t * t if t < 0.5 else 1 - 2 * (1 - t) ** 2
+
+
+class CTkAnimatedButton(ctk.CTkButton):
+    """支持悬停抬升、点击缩放、脉冲动画的 CTkButton 子类"""
+    def __init__(self, master, *args, **kwargs):
+        super().__init__(master, *args, **kwargs)
+        self._base_w = self.cget("width")
+        self._base_h = self.cget("height")
+        self._hover_lift = 4
+        self._click_scale = 0.95
+        self._pulse_scale = 1.08
+        self._anim_duration = 200  # ms
+        self._anim_id = None
+        self._bind_hover_events()
+
+    def _animate(self, target_w, target_h, duration, easing_func=None):
+        if self._anim_id:
+            self.after_cancel(self._anim_id)
+        start_w = self.winfo_width()
+        start_h = self.winfo_height()
+        steps = max(1, duration // 20) 
+        step_w = (target_w - start_w) / steps
+        step_h = (target_h - start_h) / steps
+
+        def step(i):
+            if i >= steps:
+                self.configure(width=int(target_w), height=int(target_h))
+                self._anim_id = None
+                return
+            if easing_func:
+                t = i / steps
+                eased = easing_func(t)
+                current_w = start_w + (target_w - start_w) * eased
+                current_h = start_h + (target_h - start_h) * eased
+            else:
+                current_w = start_w + step_w * (i + 1)
+                current_h = start_h + step_h * (i + 1)
+            self.configure(width=int(current_w), height=int(current_h))
+            self._anim_id = self.after(15, lambda: step(i + 1))
+
+        self._anim_id = self.after(15, lambda: step(0))
+
+    def _bind_hover_events(self):
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+
+    def _on_enter(self, event):
+        self._animate(self._base_w + self._hover_lift, self._base_h + self._hover_lift,
+                      self._anim_duration, Easing.ease_out_cubic)
+
+    def _on_leave(self, event):
+        self._animate(self._base_w, self._base_h, self._anim_duration, Easing.ease_in_out_quad)
+
+    def _on_press(self, event):
+        self._animate(self._base_w * self._click_scale, self._base_h * self._click_scale,
+                      self._anim_duration // 2, Easing.ease_in_cubic)
+
+    def _on_release(self, event):
+        # 如果鼠标仍在控件内，恢复到悬停尺寸
+        if self.winfo_containing(event.x_root, event.y_root) == self:
+            self._animate(self._base_w + self._hover_lift, self._base_h + self._hover_lift,
+                          self._anim_duration // 2, Easing.ease_out_cubic)
+        else:
+            self._animate(self._base_w, self._base_h, self._anim_duration // 2, Easing.ease_in_out_quad)
+
+    def pulse_animation(self):
+        """点击脉冲放大缩小"""
+        self._animate(self._base_w * self._pulse_scale, self._base_h * self._pulse_scale,
+                      100, Easing.ease_out_cubic)
+        self.after(200, lambda: self._animate(self._base_w, self._base_h, 100, Easing.ease_in_out_quad))
+
+
 
 # ==================== 沙盒环境工厂函数 ====================
 
@@ -216,11 +301,9 @@ def _create_sandbox_env(use_restricted_open=True, shell=None, allowed_modules=No
         shell: KIKIShell 实例（用于主线程弹窗，但子进程通常不传）。
         allowed_modules: 允许导入的额外模块列表（子进程使用）。
     """
-    import io
     import os
     import sys
     import tempfile
-    import traceback
 
     if allowed_modules is None:
         allowed_modules = []
@@ -552,7 +635,6 @@ def _run_app_script(app_code, args_str):
     """生成并执行一个隔离脚本，用于运行应用代码（不导入主模块）"""
     import subprocess
     import sys
-    import tempfile
 
     script = f"""
 import sys
@@ -650,8 +732,6 @@ def _run_plugin_script(plugin_path, func_name, args_str):
     """生成并执行一个隔离脚本，用于运行插件命令（不导入主模块）"""
     import subprocess
     import sys
-    import tempfile
-    import os
 
     # 构造脚本内容
     script = f"""
@@ -6309,12 +6389,11 @@ class KikiWindow(ctk.CTkToplevel):
         self._minimized = False
         self._maximized = False
         self._normal_geometry = None
-        self._destroy_called = False  # 防止重复调用destroy
+        self._destroy_called = False
 
-        # ===== 👇 核心修复：直接找到全局主窗口 KIKIGUI 实例 =====
+        # ===== 找到全局主窗口 KIKIGUI 实例 =====
         try:
             import tkinter as tk
-
             if tk._default_root is not None:
                 for widget in tk._default_root.winfo_children():
                     if isinstance(widget, KIKIGUI):
@@ -6322,10 +6401,8 @@ class KikiWindow(ctk.CTkToplevel):
                         break
         except Exception:
             pass
-        # 如果上面没找到，则尝试从 master 的 master 追溯
         if self.gui is None and master is not None and hasattr(master, "master"):
             self.gui = master.master
-        # ========================================================
 
         # ===== 自定义标题栏 =====
         self.title_bar = ctk.CTkFrame(self, height=30, fg_color="#3a3a3a", corner_radius=0)
@@ -6341,37 +6418,22 @@ class KikiWindow(ctk.CTkToplevel):
         btn_frame.pack(side="right", padx=5)
 
         self.btn_min = ctk.CTkButton(
-            btn_frame,
-            text="─",
-            width=25,
-            height=25,
-            fg_color="transparent",
-            text_color="white",
-            hover_color="#555555",
+            btn_frame, text="─", width=25, height=25,
+            fg_color="transparent", text_color="white", hover_color="#555555",
             command=self._minimize,
         )
         self.btn_min.pack(side="left", padx=2)
 
         self.btn_max = ctk.CTkButton(
-            btn_frame,
-            text="☐",
-            width=25,
-            height=25,
-            fg_color="transparent",
-            text_color="white",
-            hover_color="#555555",
+            btn_frame, text="☐", width=25, height=25,
+            fg_color="transparent", text_color="white", hover_color="#555555",
             command=self._toggle_maximize,
         )
         self.btn_max.pack(side="left", padx=2)
 
         self.btn_close = ctk.CTkButton(
-            btn_frame,
-            text="✕",
-            width=25,
-            height=25,
-            fg_color="transparent",
-            text_color="white",
-            hover_color="#cc0000",
+            btn_frame, text="✕", width=25, height=25,
+            fg_color="transparent", text_color="white", hover_color="#cc0000",
             command=self.destroy,
         )
         self.btn_close.pack(side="left", padx=2)
@@ -6379,7 +6441,6 @@ class KikiWindow(ctk.CTkToplevel):
         self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.content_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # ===== 关键修复：绑定窗口关闭事件 =====
         self.protocol("WM_DELETE_WINDOW", self.destroy)
 
         # ===== 标题栏事件绑定 =====
@@ -6398,9 +6459,18 @@ class KikiWindow(ctk.CTkToplevel):
         self.after(50, self.focus_force)
 
         import tkinter as tk
-
         if tk._default_root and isinstance(tk._default_root, KIKIGUI):
             self.gui = tk._default_root
+
+    def _on_map_event(self, event):
+        """窗口显示时更新状态"""
+        if event.widget == self:
+            self._paused = False
+
+    def _on_unmap_event(self, event):
+        """窗口隐藏时更新状态"""
+        if event.widget == self:
+            self._paused = True
 
     def _show_system_menu(self, event):
         """标题栏右键弹出系统菜单"""
@@ -7204,7 +7274,6 @@ try:
 except ImportError:
     try:
         from PySide6.QtCore import Qt, QUrl
-        from PySide6.QtWebEngineCore import QWebEnginePage
         from PySide6.QtWebEngineWidgets import QWebEnginePage, QWebEngineView
         from PySide6.QtWidgets import (
             QApplication,
@@ -8520,7 +8589,7 @@ class Notification(ctk.CTkToplevel):
     def _fade_in(self):
         self.alpha += 0.1
         if self.alpha < 1.0:
-            self.attributes("-alpha", self.alpha)
+            self.attributes("-alpha", Easing.ease_out_cubic(self.alpha))
             self.after(30, self._fade_in)
         else:
             self.attributes("-alpha", 1.0)
@@ -8528,7 +8597,7 @@ class Notification(ctk.CTkToplevel):
     def _fade_out(self):
         self.alpha -= 0.1
         if self.alpha > 0:
-            self.attributes("-alpha", self.alpha)
+            self.attributes("-alpha", Easing.ease_in_cubic(self.alpha))
             self.after(30, self._fade_out)
         else:
             self.destroy()
@@ -10233,7 +10302,6 @@ class FileManager(ctk.CTkFrame):
 
         def do_search():
             """后台执行搜索"""
-            import os
             visited = set()  # 防止符号链接循环
 
             def collect(dir_path, depth=0):
@@ -10466,6 +10534,7 @@ class FileManager(ctk.CTkFrame):
                 try:
                     import base64
                     import io
+
                     from PIL import Image
 
                     if content and len(content) > 100:
@@ -10613,8 +10682,7 @@ class FileManager(ctk.CTkFrame):
             if sel:
                 item = sel[0]
                 display_name = self.tree.item(item, "text")
-                if display_name.startswith("🔒 "):
-                    display_name = display_name[2:]
+                display_name = display_name.removeprefix("🔒 ")
                 full = self.path + "/" + display_name if self.path != "/" else "/" + display_name
                 node = self.shell.fs.resolve(full, self.username)
                 if node and isinstance(node, File):
@@ -10640,8 +10708,7 @@ class FileManager(ctk.CTkFrame):
             return
         item = sel[0]
         display_name = self.tree.item(item, "text")
-        if display_name.startswith("🔒 "):
-            display_name = display_name[2:]
+        display_name = display_name.removeprefix("🔒 ")
         full = self.path + "/" + display_name if self.path != "/" else "/" + display_name
         # 调用压缩命令
         self.shell._execute(f"compress {full}")
@@ -10655,8 +10722,7 @@ class FileManager(ctk.CTkFrame):
             return
         item = sel[0]
         display_name = self.tree.item(item, "text")
-        if display_name.startswith("🔒 "):
-            display_name = display_name[2:]
+        display_name = display_name.removeprefix("🔒 ")
         full = self.path + "/" + display_name if self.path != "/" else "/" + display_name
         self.gui._open_editor_with_file(full)
 
@@ -10668,8 +10734,7 @@ class FileManager(ctk.CTkFrame):
             return
         item = sel[0]
         display_name = self.tree.item(item, "text")
-        if display_name.startswith("🔒 "):
-            display_name = display_name[2:]
+        display_name = display_name.removeprefix("🔒 ")
         full = self.path + "/" + display_name if self.path != "/" else "/" + display_name
         if hasattr(self.gui, "_add_desktop_icon"):
             self.gui._add_desktop_icon(full, display_name)
@@ -10684,8 +10749,7 @@ class FileManager(ctk.CTkFrame):
             return
         item = sel[0]
         display_name = self.tree.item(item, "text")
-        if display_name.startswith("🔒 "):
-            display_name = display_name[2:]
+        display_name = display_name.removeprefix("🔒 ")
         full = self.path + "/" + display_name if self.path != "/" else "/" + display_name
         node = self.shell.fs.resolve(full, self.username)
         if node is None:
@@ -11196,8 +11260,7 @@ class FileManager(ctk.CTkFrame):
             return
         item = sel[0]
         display_name = self.tree.item(item, "text")
-        if display_name.startswith("🔒 "):
-            display_name = display_name[2:]
+        display_name = display_name.removeprefix("🔒 ")
 
         if self.mode == "host":
             full = os.path.join(self.host_cwd, display_name)
@@ -12877,14 +12940,15 @@ class UnifiedAIEngine:
         self.shell = shell
         self.vfs = shell.fs
         self.username = shell.username
-        self.messages = []                # 对话历史
-        self.provider = None              # 当前 provider
-        self.model = None                 # 当前模型
-        self.available_models = []        # 可用模型列表
-        self.thinking_callback = None     # 思考回调（由GUI设置）
-        self.reply_callback = None        # 回复回调（由GUI设置）
+        self.messages = []
+        self.provider = None
+        self.model = None
+        self.available_models = []
+        self.thinking_callback = None
+        self.reply_callback = None
+        self._model_user_choice = None
+        self._popup_parent = None
 
-        # 定义工具（包含所有可执行的系统操作）
         self.tools = [
             {"name": "open_file_manager", "description": "打开文件管理器", "args": {}},
             {"name": "open_terminal", "description": "打开终端", "args": {}},
@@ -12922,29 +12986,30 @@ class UnifiedAIEngine:
             '{"tool": "new_folder", "args": {"folder_name": "test"}}\n'
             "如果一次需要多个动作，可以连续输出多行 JSON，系统会按顺序执行。\n"
             "如果用户只是普通对话，直接正常回答，不要添加工具 JSON。\n"
+            "【路径规则】\n"
+            "当用户提到文件名而未给出完整路径时，优先使用当前工作目录。\n"
+            "除非用户明确说\"桌面\"，否则不要默认使用 Desktop。\n"
         )
-
-        self._model_user_choice = None
-
-        # 弹窗父窗口（由AI聊天窗口设置）
-        self._popup_parent = None
 
         self.detect_local_ollama()
 
     # ---------- 模型检测 ----------
     def detect_local_ollama(self):
-        """检测本机 Ollama 服务（尝试 localhost 和 127.0.0.1）"""
-        import urllib.request
-        for host in ("127.0.0.1", "localhost"):
-            try:
-                url = f"http://{host}:11434/api/tags"
-                req = urllib.request.urlopen(url, timeout=2)
-                data = json.loads(req.read())
-                self.available_models = [m["name"] for m in data.get("models", [])]
-                if self.available_models:
-                    return True
-            except Exception:
-                continue
+        """检测本机 Ollama 服务，只填充 available_models，不自动启用"""
+        try:
+            import urllib.request
+            for host in ("127.0.0.1", "localhost"):
+                try:
+                    url = f"http://{host}:11434/api/tags"
+                    req = urllib.request.urlopen(url, timeout=2)
+                    data = json.loads(req.read())
+                    self.available_models = [m["name"] for m in data.get("models", [])]
+                    if self.available_models:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
         self.available_models = []
         return False
 
@@ -12960,7 +13025,7 @@ class UnifiedAIEngine:
             return "发现本地模型（待确认）", self.available_models[0]
         else:
             return "未就绪", None
-    # ---------- 配套补丁包 ----------
+
     def _try_enable_model_sync(self):
         """尝试启用在线模型，返回True表示使用在线，False表示离线（必须在主线程调用）"""
         if self._model_user_choice is not None:
@@ -12980,8 +13045,8 @@ class UnifiedAIEngine:
                 parent_win = self._popup_parent if self._popup_parent and self._popup_parent.winfo_exists() else self.shell.gui_app
                 resp = messagebox.askyesno(
                     "发现本地 AI 引擎",
-                    f"检测到本地 Ollama 模型：{self.available_models[0]}\n\n是否启用在线 AI？\n选择“否”将使用离线模式。",
-                    parent=parent_win
+                    f"检测到本地 Ollama 模型：{self.available_models[0]}\n\n是否启用在线 AI？\n选择\"否\"将使用离线模式。",
+                    parent=parent_win,
                 )
                 if resp:
                     self.provider = "ollama"
@@ -12989,7 +13054,6 @@ class UnifiedAIEngine:
                     self._model_user_choice = True
                     return True
                 else:
-                    # 用户选择离线，清除所有在线状态
                     self.provider = None
                     self.model = None
                     self._model_user_choice = False
@@ -13002,39 +13066,8 @@ class UnifiedAIEngine:
         self._model_user_choice = False
         return False
 
-    def ask_sync(self, user_text):
-        """同步获取 AI 回复（用于命令行），自动处理在线/离线"""
-        # 确保模型选择已完成（如果还没选择，尝试询问）
-        if self._model_user_choice is None:
-            # 注意：这里不能直接弹窗（因为可能在后台线程），所以我们只尝试在线配置或离线
-            # 但对于 ai 命令，它本身在主线程执行，所以可以直接调用 _try_enable_model_sync
-            pass
-
-        # 如果已经启用在线模型，则使用在线
-        if self.provider is not None:
-            messages = [{"role": "user", "content": user_text}]
-            if self.provider == "ollama":
-                reply = self._query_ollama(self.model, messages)
-            else:
-                reply = self._query_litellm(self.provider, self.model, messages)
-            # 提取思考并显示
-            thinking = self.extract_thinking(reply)
-            if thinking:
-                print(f"🧠 思考: {thinking}")
-                reply = self.remove_thinking(reply)
-            # 解析工具调用并执行
-            actions = self.parse_tool_calls(reply)
-            if actions:
-                self.shell._execute_ai_actions(actions)
-                reply = "✅ 已根据您的指令完成操作。"
-            return reply, "🤖"
-        else:
-            # 离线模式
-            return self._offline_reply(user_text)
-
     # ---------- 对话入口 ----------
     def chat(self, user_input):
-        """接收用户输入，后台异步处理并回调"""
         if not user_input.strip():
             return
         self.messages.append({"role": "user", "content": user_input})
@@ -13049,7 +13082,7 @@ class UnifiedAIEngine:
                 self._handle_multi_agent(user_text)
                 return
 
-            # 2. 检测到复杂多步骤指令（多个动作或连接词）且 Ollama 可用 → 自动转多代理
+            # 2. 复杂多步骤指令 → 自动转多代理（仅 Ollama 可用时）
             if self._is_complex_multi_step(user_text) and self.provider == "ollama":
                 self._handle_multi_agent(user_text)
                 return
@@ -13075,8 +13108,26 @@ class UnifiedAIEngine:
             # 解析工具调用
             actions = self.parse_tool_calls(reply)
             if actions:
-                self.shell._execute_ai_actions(actions)
-                reply = "✅ 已根据您的指令完成操作。"
+                # 根据调用来源设置输出目标
+                if self.reply_callback:
+                    self.shell._ai_output_target = "chat"
+                    self.shell._ai_chat_callback = lambda msg: self._emit_reply(msg, "🔧")
+                else:
+                    self.shell._ai_output_target = "terminal"
+                    self.shell._ai_chat_callback = None
+                try:
+                    success, fail, fail_msgs = self.shell._execute_ai_actions(actions)
+                finally:
+                    self.shell._ai_output_target = "terminal"
+                    self.shell._ai_chat_callback = None
+
+                # 根据结果生成准确的回复
+                if fail == 0:
+                    reply = f"✅ 已成功执行 {success} 个操作。"
+                elif success == 0:
+                    reply = f"❌ 操作失败（{fail} 个）：\n" + "\n".join(fail_msgs[:3])
+                else:
+                    reply = f"⚠️ 部分成功：{success} 个成功，{fail} 个失败。\n失败详情：\n" + "\n".join(fail_msgs[:3])
 
             self.messages.append({"role": "assistant", "content": reply})
             self._emit_reply(reply, "🤖")
@@ -13086,33 +13137,29 @@ class UnifiedAIEngine:
             self._emit_reply(error_msg, "❌")
 
     def _is_complex_multi_step(self, text):
-        """判断是否为复杂多步骤指令（含连接词或至少两个动作关键词）"""
+        """判断是否为复杂多步骤指令"""
         action_keywords = [
             "打开", "创建", "新建", "写入", "删除", "移动", "复制", "重命名",
             "关闭", "启动", "运行", "下载", "搜索", "列出", "查看", "计算", "翻译"
         ]
         connectors = ["再", "然后", "接着", "之后", "最后", "并且"]
-        # 含连接词
         if any(connector in text for connector in connectors):
             return True
-        # 统计去重动作关键词
-        present = set(kw for kw in action_keywords if kw in text)
+        present = {kw for kw in action_keywords if kw in text}
         return len(present) >= 2
 
     def _emit_reply(self, reply, emoji="🤖"):
-        """通过回调发到 GUI"""
         if self.reply_callback:
             self.reply_callback(reply, emoji)
-        elif hasattr(self.shell, 'gui_app') and self.shell.gui_app:
+        elif hasattr(self.shell, "gui_app") and self.shell.gui_app:
             self.shell.gui_app._show_ai_reply(reply, emoji)
         else:
             print(f"AI: {reply}")
 
     def _emit_thinking(self, thinking):
-        """通过回调发思考过程到 GUI"""
         if self.thinking_callback:
             self.thinking_callback(thinking)
-        elif hasattr(self.shell, 'gui_app') and self.shell.gui_app:
+        elif hasattr(self.shell, "gui_app") and self.shell.gui_app:
             self.shell.gui_app._show_thinking(thinking)
         else:
             print(f"🧠 思考: {thinking}")
@@ -13131,7 +13178,6 @@ class UnifiedAIEngine:
 
     # ---------- 工具解析（JSON） ----------
     def parse_tool_calls(self, text):
-        """解析 AI 输出中的 JSON 工具调用"""
         import re
         actions = []
         matches = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text)
@@ -13140,7 +13186,6 @@ class UnifiedAIEngine:
                 data = json.loads(match)
                 tool = data.get("tool")
                 args = data.get("args", {})
-                # 映射到具体的动作元组
                 if tool == "open_file_manager":
                     actions.append(("open", "/"))
                 elif tool == "open_terminal":
@@ -13185,13 +13230,12 @@ class UnifiedAIEngine:
 
     # ---------- 模型请求 ----------
     def _query_ollama(self, model, messages):
-        """调用本地 Ollama"""
         try:
             import requests
             payload = {
                 "model": model,
                 "messages": [{"role": "system", "content": self.system_prompt}] + messages,
-                "stream": False
+                "stream": False,
             }
             r = requests.post("http://localhost:11434/api/chat", json=payload, timeout=300)
             if r.status_code == 200:
@@ -13204,12 +13248,12 @@ class UnifiedAIEngine:
             payload = {
                 "model": model,
                 "messages": [{"role": "system", "content": self.system_prompt}] + messages,
-                "stream": False
+                "stream": False,
             }
             req = urllib.request.Request(
                 "http://localhost:11434/api/chat",
                 data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"}
+                headers={"Content-Type": "application/json"},
             )
             old_timeout = socket.getdefaulttimeout()
             socket.setdefaulttimeout(300)
@@ -13229,13 +13273,12 @@ class UnifiedAIEngine:
             model=f"{provider}/{model}",
             messages=[{"role": "system", "content": self.system_prompt}] + messages,
             api_key=os.environ.get(f"{provider.upper()}_API_KEY"),
-            timeout=300
+            timeout=300,
         )
         return response["choices"][0]["message"]["content"]
 
     # ---------- 多代理处理 ----------
     def _handle_multi_agent(self, user_text):
-        """多代理指令处理（异步，用于GUI）"""
         question = user_text.replace("多代理:", "").replace("multi:", "").strip()
         if not self._quick_check_ollama():
             self._emit_reply("本地 Ollama 未运行，无法执行多代理任务。", "❌")
@@ -13245,7 +13288,6 @@ class UnifiedAIEngine:
         self._emit_reply(reply, "🤖")
 
     def handle_multi_agent_sync(self, user_text):
-        """多代理指令处理（同步，用于命令行）"""
         question = user_text.replace("多代理:", "").replace("multi:", "").strip()
         if not self._quick_check_ollama():
             return "本地 Ollama 未运行，无法执行多代理任务。", "❌"
@@ -13274,52 +13316,33 @@ class UnifiedAIEngine:
         import tempfile
         import pygame
         import edge_tts
-
-        # 创建临时文件
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         tmp_path = tmp.name
-        tmp.close()  # 先关闭，避免文件被占用
-
+        tmp.close()
         try:
-            # 使用 edge-tts 生成语音文件
             communicate = edge_tts.Communicate(text, "zh-CN-XiaoxiaoNeural")
             await communicate.save(tmp_path)
-
-            # 检查文件是否真的生成成功
             if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
                 raise Exception("语音文件生成失败")
-
-            # 初始化 pygame mixer（如果尚未初始化）
             if not pygame.mixer.get_init():
                 pygame.mixer.init()
-
-            # 播放
             pygame.mixer.music.load(tmp_path)
             pygame.mixer.music.play()
             while pygame.mixer.music.get_busy():
                 time.sleep(0.1)
-
         except Exception as e:
-            # 播放失败，打印错误但不会中断主程序
             print(f"语音合成失败: {e}")
-
         finally:
-            # 无论成功与否，确保删除临时文件
             try:
                 os.unlink(tmp_path)
-            except:
+            except Exception:
                 pass
 
     def clear_history(self):
         self.messages = []
 
-    # ---------- 完整离线回复引擎（原 _local_ai_reply 全部逻辑） ----------
+    # ---------- 完整离线回复引擎 ----------
     def _offline_reply(self, text):
-        """
-        纯离线回复：内置大量意图识别，不依赖任何在线模型。
-        注意：多代理逻辑已由 _handle_multi_agent 处理，这里不再包含。
-        以下为原 kiki_os.py 中 _local_ai_reply 的完整离线分支，未作任何简化。
-        """
         import datetime
         import difflib
         import random
@@ -13335,7 +13358,6 @@ class UnifiedAIEngine:
                 self._context_memory = {}
             context = self._context_memory
 
-            # === 用户自定义规则（仍保留） ===
             user_rules = self.shell._load_ai_rules()
             for pattern, (handler, typ) in user_rules.items():
                 if re.search(pattern, text, re.IGNORECASE):
@@ -13354,6 +13376,39 @@ class UnifiedAIEngine:
                     lines = [f"PID {pid} 运行中" for pid in self.shell.real_processes]
                     return "\n".join(lines), "📋"
                 return "当前没有通过本系统启动的子进程。", "😴"
+
+            # === 文件读取（优先当前工作目录） ===
+            if "读取文件" in text_lower or "查看文件" in text_lower or "显示文件" in text_lower or "读取" in text_lower:
+                match = re.search(r"(?:读取文件|查看文件|显示文件|读取)\s+(.+)", text)
+                if match:
+                    path = match.group(1).strip()
+                    cwd = self.shell.fs.get_abs_path(self.shell.fs.cwd)
+                    candidates = []
+                    if path.startswith("/"):
+                        candidates.append(path)
+                    else:
+                        candidates.append(f"{cwd}/{path}" if cwd != "/" else f"/{path}")
+                        candidates.append(f"/home/{self.username}/{path}")
+                        candidates.append(f"/home/{self.username}/Documents/{path}")
+                        candidates.append(f"/home/{self.username}/Desktop/{path}")
+                    found_node = None
+                    found_path = None
+                    for cand in candidates:
+                        node = self.shell.fs.resolve(cand, self.username)
+                        if node and isinstance(node, File):
+                            found_node = node
+                            found_path = cand
+                            break
+                    if found_node is None:
+                        return "❌ 文件不存在，已尝试以下路径:\n" + "\n".join(f"  {c}" for c in candidates), "😵"
+                    content = found_node.read()
+                    try:
+                        content = content.decode("utf-8", errors="ignore")
+                    except Exception:
+                        pass
+                    if len(content) > 500:
+                        content = content[:500] + "\n... (截断)"
+                    return f"📄 {found_path} 的内容:\n{content}", "📄"
 
             # === 文件操作 ===
             if "删除文件" in text_lower or "删除 " in text_lower:
@@ -13401,18 +13456,6 @@ class UnifiedAIEngine:
                     if self.shell.fs.move(abs_src, abs_dst, self.username):
                         return f"✏️ 已重命名为: {dst}", "✏️"
                     return "❌ 重命名失败", "😵"
-
-            if "查看文件" in text_lower or "显示文件" in text_lower:
-                match = re.search(r"(?:查看文件|显示文件)\s+(.+)", text)
-                if match:
-                    path = match.group(1).strip()
-                    abs_path = self.shell.fs._resolve(path)
-                    content = self.shell.fs.read_file(abs_path, self.username)
-                    if content is not None:
-                        if len(content) > 500:
-                            content = content[:500] + "\n... (截断)"
-                        return f"📄 {path} 的内容:\n{content}", "📄"
-                    return "❌ 文件不存在或无法读取", "😵"
 
             if "复制 " in text_lower or "拷贝 " in text_lower:
                 match = re.search(r"(?:复制|拷贝)\s+(.+?)\s+(?:到|至)\s+(.+)", text)
@@ -13519,38 +13562,13 @@ class UnifiedAIEngine:
                             if parts and parts[0].isdigit():
                                 pid = int(parts[0])
                                 try:
-                                    os.kill(pid, signal.SIGTERM if sys.platform != "win32" else signal.SIGTERM)
+                                    os.kill(pid, signal.SIGTERM)
                                     killed.append(str(pid))
                                 except Exception:
                                     pass
                     if killed:
                         return f"💀 已终止以下进程: {', '.join(killed)}", "💀"
                     return f"❌ 未找到匹配 '{target}' 的进程", "😵"
-
-            if "杀掉卡死的进程" in text_lower or "杀死卡死的进程" in text_lower:
-                import sys
-                from io import StringIO
-                old_stdout = sys.stdout
-                sys.stdout = StringIO()
-                try:
-                    self.shell.ps_cmd("")
-                    ps_output = sys.stdout.getvalue()
-                finally:
-                    sys.stdout = old_stdout
-                killed = []
-                for line in ps_output.splitlines():
-                    if "python" in line.lower() or "py" in line.lower():
-                        parts = line.split()
-                        if parts and parts[0].isdigit():
-                            pid = int(parts[0])
-                            try:
-                                os.kill(pid, signal.SIGTERM if sys.platform != "win32" else signal.SIGTERM)
-                                killed.append(str(pid))
-                            except Exception:
-                                pass
-                if killed:
-                    return f"💀 已终止卡死的进程（Python 相关）: {', '.join(killed)}", "💀"
-                return "😊 未发现明显卡死的进程", "😊"
 
             # === 查找文件 ===
             if "查找" in text_lower or "搜索" in text_lower:
@@ -13587,40 +13605,6 @@ class UnifiedAIEngine:
                                 lines.append(f"  ... 还有 {len(results)-10} 个结果")
                             return "\n".join(lines), "🔍"
                         return f"❌ 未找到包含 '{pattern}' 的内容", "😵"
-                else:
-                    match = re.search(r"查找\s*(.+?)\s+下所有\s*(.+)", text)
-                    if not match:
-                        match = re.search(r"查找\s*(.+?)\s+(.+)", text)
-                    if match:
-                        path = match.group(1).strip()
-                        pattern = match.group(2).strip()
-                        pattern = re.sub(r"文件|目录", "", pattern).strip()
-                        if pattern.startswith("."):
-                            pattern = "*" + pattern
-                        abs_path = self.shell.fs._resolve(path)
-                        import fnmatch
-                        results = []
-
-                        def walk_dir(node, current_path):
-                            if isinstance(node, File):
-                                if fnmatch.fnmatch(node.name, pattern):
-                                    results.append(current_path)
-                            elif isinstance(node, Directory):
-                                for child in node._children.values():
-                                    child_path = current_path + "/" + child.name if current_path != "/" else "/" + child.name
-                                    walk_dir(child, child_path)
-
-                        start_node = self.shell.fs.resolve(abs_path, self.username)
-                        if start_node:
-                            walk_dir(start_node, abs_path)
-                        if results:
-                            lines = [f"在 {path} 中找到 {len(results)} 个匹配项:"]
-                            for r in results[:10]:
-                                lines.append(f"  {r}")
-                            if len(results) > 10:
-                                lines.append(f"  ... 还有 {len(results)-10} 个结果")
-                            return "\n".join(lines), "🔍"
-                        return f"❌ 未找到匹配 '{pattern}' 的文件", "😵"
 
             # === 系统信息 ===
             if "系统状态" in text_lower or "状态汇总" in text_lower:
@@ -13654,20 +13638,6 @@ class UnifiedAIEngine:
                     return f"📜 审计日志:\n{content}", "📜"
                 return "📜 暂无审计日志", "📜"
 
-            if "查看网络连接" in text_lower or "网络连接" in text_lower:
-                import sys
-                from io import StringIO
-                old_stdout = sys.stdout
-                sys.stdout = StringIO()
-                try:
-                    self.shell.netstat_cmd("-a")
-                    output = sys.stdout.getvalue()
-                finally:
-                    sys.stdout = old_stdout
-                if output.strip():
-                    return f"📡 网络连接:\n{output}", "📡"
-                return "📡 暂无网络连接信息", "📡"
-
             # === 网络 ===
             if "ping " in text_lower:
                 match = re.search(r"ping\s+(.+)", text)
@@ -13676,11 +13646,8 @@ class UnifiedAIEngine:
                     import subprocess
                     import sys
                     try:
-                        if sys.platform == "win32":
-                            cmd = ["ping", "-n", "1", host]
-                        else:
-                            cmd = ["ping", "-c", "1", host]
-                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                        cmd = ["ping", "-n", "1", host] if sys.platform == "win32" else ["ping", "-c", "1", host]
+                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
                         output = result.stdout + result.stderr
                         if output.strip():
                             return f"🏓 Ping {host}:\n{output}", "🏓"
@@ -13707,7 +13674,7 @@ class UnifiedAIEngine:
                         sys.stdout = old_stdout
                     if output.strip():
                         return f"⬇️ 下载任务:\n{output}", "⬇️"
-                    return "⬇️ 下载任务已启动（后台运行），请查看终端输出。", "⬇️"
+                    return "⬇️ 下载任务已启动（后台运行）。", "⬇️"
 
             # === 定时任务 ===
             if "每天" in text_lower and "执行" in text_lower:
@@ -13726,17 +13693,6 @@ class UnifiedAIEngine:
                     self.shell.config.save_user_config(self.username)
                     return f"⏰ 已添加每日定时任务: 每天 {hour}:00 执行 '{cmd}'", "⏰"
 
-            if "列出所有定时任务" in text_lower or "定时任务列表" in text_lower:
-                tasks = self.shell.config.get("schedule_tasks", [])
-                if not tasks:
-                    return "⏰ 当前没有定时任务", "📭"
-                lines = ["⏰ 定时任务列表:"]
-                for t in tasks:
-                    dt = datetime.fromtimestamp(t["time"]).strftime("%Y-%m-%d %H:%M")
-                    repeat = t.get("repeat", "一次")
-                    lines.append(f"  {dt} ({repeat}) -> {t['command']}")
-                return "\n".join(lines), "⏰"
-
             # === 清理 ===
             if "清理缓存" in text_lower:
                 tmp_path = "/tmp"
@@ -13750,57 +13706,6 @@ class UnifiedAIEngine:
                             count += 1
                     return f"🧹 已清理 {count} 个临时文件", "🧹"
                 return "🧹 没有临时文件需要清理", "😊"
-
-            if "优化内存" in text_lower:
-                import sys
-                from io import StringIO
-                old_stdout = sys.stdout
-                sys.stdout = StringIO()
-                try:
-                    self.shell.mem_cmd("")
-                    output = sys.stdout.getvalue()
-                    if sys.platform.startswith("linux"):
-                        try:
-                            with open("/proc/sys/vm/drop_caches", "w") as f:
-                                f.write("3")
-                            output += "\n✅ 已释放页面缓存（Linux）"
-                        except Exception:
-                            pass
-                finally:
-                    sys.stdout = old_stdout
-                return f"💾 内存优化完成:\n{output}", "💾"
-
-            # === 插件 ===
-            if "列出已安装插件" in text_lower or "插件列表" in text_lower:
-                if hasattr(self.shell, "gui_app") and self.shell.gui_app:
-                    plugins = self.shell.gui_app.plugin_manager.list_plugins()
-                    if plugins:
-                        lines = ["🔌 已安装插件:"]
-                        for name, ver in plugins:
-                            lines.append(f"  {name} v{ver}")
-                        return "\n".join(lines), "🔌"
-                    return "🔌 没有安装任何插件", "📭"
-                return "🔌 插件管理仅在 GUI 模式下可用", "😵"
-
-            # === 偏好记忆 ===
-            if "我喜欢" in text_lower or "偏好" in text_lower:
-                is_query = any(word in text_lower for word in ["什么", "哪些", "吗", "呢", "呀"])
-                if is_query:
-                    pref = self.shell.config.get("ai_preferences", {}).get("general")
-                    if pref:
-                        return f"💡 您之前说过喜欢: {pref}", "💡"
-                    return "💡 您还没告诉我您的偏好呢，可以说：我喜欢用蓝色主题", "💡"
-                else:
-                    match = re.search(r"我喜欢\s*(.+)", text)
-                    if match:
-                        pref = match.group(1).strip()
-                        if not hasattr(self, "_preferences"):
-                            self._preferences = {}
-                        self._preferences["general"] = pref
-                        self.shell.config.set("ai_preferences", self._preferences, self.username)
-                        self.shell.config.save_user_config(self.username)
-                        return f"💡 已记住您的偏好: {pref}", "💡"
-                    return "💡 您可以说：我喜欢用蓝色主题 来设置偏好", "💡"
 
             # === 应用操作 ===
             ACTION_MAP = {
@@ -13890,42 +13795,7 @@ class UnifiedAIEngine:
                         similar = [n for n in self.shell.fs.listdir(self.shell.fs.get_abs_path(self.shell.fs.cwd), self.username) or [] if target_path in n]
                         if similar:
                             return f"🤔 没找到 '{target_path}'，您是想打开 '{similar[0]}' 吗？", "🤔"
-                return "🤔 您想打开什么应用呢？比如：文件管理器、终端、设置、计算器。或者直接告诉我路径，比如：'打开 Desktop'", "🤔"
-
-            if action == "new":
-                folder_match = re.search(r"新建\s*文件夹\s*([\w\-\_]+)?", original_text)
-                if folder_match:
-                    folder_name = folder_match.group(1) or "新建文件夹"
-                    if hasattr(self.shell, "gui_app") and self.shell.gui_app:
-                        desktop = f"/home/{self.username}/Desktop"
-                        self.shell.fs.mkdir(f"{desktop}/{folder_name}", self.username)
-                        return f"📁 已在桌面新建文件夹: {folder_name}", "📁"
-                return "📁 请告诉我要新建什么，例如：'新建文件夹 我的项目'", "📁"
-
-            if action == "delete":
-                file_match = re.search(r"删除\s*([\w\-\_\.]+)", original_text)
-                if file_match:
-                    filename = file_match.group(1)
-                    if filename in ["文件夹", "目录", "文件"]:
-                        return "📂 您想删除哪个具体的文件夹/文件呢？请告诉我名称，例如：'删除 我的项目'", "📂"
-                    if hasattr(self.shell, "gui_app") and self.shell.gui_app:
-                        cwd = self.shell.fs.get_abs_path(self.shell.fs.cwd)
-                        path = f"{cwd}/{filename}"
-                        node = self.shell.fs.resolve(path, self.username)
-                        if node:
-                            success, _ = self.shell.fs.move_to_trash(path, self.username)
-                            if success:
-                                return f"🗑️ 已将文件/文件夹 '{filename}' 移入回收站", "🗑️"
-                        items = self.shell.fs.listdir(cwd, self.username) or []
-                        similar = [n for n in items if filename in n]
-                        if similar:
-                            return f"❌ 没找到 '{filename}'，最相似的是: {', '.join(similar[:3])}", "😕"
-                return "⚠️ 您想删除什么文件或文件夹？请输入具体名称", "⚠️"
-
-            if action == "list" or "列出" in text_lower or "目录" in text_lower:
-                if hasattr(self.shell, "gui_app") and self.shell.gui_app:
-                    self.shell._execute("dir")
-                return "📋 已为您在终端输出当前目录列表", "📋"
+                return "🤔 您想打开什么应用呢？比如：文件管理器、终端、设置、计算器。", "🤔"
 
             # === 数学计算 ===
             def chinese_to_arabic(chinese_str):
@@ -13951,7 +13821,7 @@ class UnifiedAIEngine:
                 op_map = {"乘以": "*", "除以": "/", "加上": "+", "减去": "-", "加": "+", "减": "-", "乘": "*", "除": "/"}
                 for cn_op, en_op in op_map.items():
                     text = text.replace(cn_op, en_op)
-                chinese_num_pattern = r"[零一二三四五六七八九十百千万亿两]++(?:[十百千万亿][零一二三四五六七八九两]*)*"
+                chinese_num_pattern = r"[零一二三四五六七八九十百千万亿两]+(?:[十百千万亿][零一二三四五六七八九两]*)*"
                 text = re.sub(chinese_num_pattern, lambda m: chinese_to_arabic(m.group()), text)
                 raw_matches = re.findall(r"[0-9+\-*/()]+", text)
                 expressions = []
@@ -14014,7 +13884,7 @@ class UnifiedAIEngine:
                         result = round(result, 4)
                     return f"🧮 结果是: {result}", "🧮"
                 except Exception:
-                    return "🧮 算式解析失败，请检查格式，例如 'calc 5+5'", "🧮"
+                    return "🧮 算式解析失败，请检查格式", "🧮"
 
             # === 单位换算 ===
             def cn2num(cn_str):
@@ -14058,7 +13928,7 @@ class UnifiedAIEngine:
                     else:
                         value = cn2num(val_raw)
                         if value is None:
-                            return "🤔 数字格式有点怪，请直接说‘一米等于多少厘米’", "🤔"
+                            return "🤔 数字格式有点怪", "🤔"
                 except Exception:
                     return "🤔 没识别出正确的数量", "🤔"
 
@@ -14075,77 +13945,29 @@ class UnifiedAIEngine:
                     "克": 0.001, "千克": 1.0, "斤": 0.5, "两": 0.05,
                     "磅": 0.45359237, "盎司": 0.028349523125,
                     "升": 1.0, "毫升": 0.001,
-                    "千米每小时": 1.0, "英里每小时": 1.60934, "米每秒": 3.6
+                    "千米每小时": 1.0, "英里每小时": 1.60934, "米每秒": 3.6,
                 }
                 speed_units = ["千米每小时", "英里每小时", "米每秒"]
                 if from_unit not in base_unit_map or to_unit not in base_unit_map:
-                    return "📐 不支持这些单位，试试 '米'、'千克'、'升'、'千米每小时' 等。", "📐"
+                    return "📐 不支持这些单位", "📐"
                 from_is_speed = from_unit in speed_units
                 to_is_speed = to_unit in speed_units
                 if from_is_speed != to_is_speed:
-                    return "📐 不能跨类别换算（速度↔其他）", "📐"
+                    return "📐 不能跨类别换算", "📐"
                 if not from_is_speed:
                     category_map = {
                         "米": "length", "千米": "length", "厘米": "length", "毫米": "length",
                         "英里": "length", "英尺": "length", "英寸": "length",
                         "克": "mass", "千克": "mass", "斤": "mass", "两": "mass",
-                        "磅": "mass", "盎司": "mass",
-                        "升": "volume", "毫升": "volume"
+                        "磅": "mass", "盎司": "mass", "升": "volume", "毫升": "volume",
                     }
                     if category_map.get(from_unit) != category_map.get(to_unit):
-                        return "📐 不能跨类别换算（长度↔质量↔体积）", "📐"
+                        return "📐 不能跨类别换算", "📐"
 
                 result = value * base_unit_map[from_unit] / base_unit_map[to_unit]
                 result = int(result) if result.is_integer() else round(result, 4)
                 display_val = int(value) if value.is_integer() else value
                 return f"📐 {display_val}{from_unit} = {result}{to_unit}", "📐"
-
-            # === 货币换算 ===
-            def chinese_to_float(chinese_num):
-                digit_map = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "两": 2}
-                unit_map = {"十": 10, "百": 100, "千": 1000, "万": 10000, "亿": 100000000}
-                result = 0
-                temp = 0
-                for char in chinese_num:
-                    if char in digit_map:
-                        temp = digit_map[char]
-                    elif char in unit_map:
-                        unit = unit_map[char]
-                        if temp == 0:
-                            temp = 1
-                        result += temp * unit
-                        temp = 0
-                    else:
-                        break
-                result += temp
-                return float(result)
-
-            money_match = re.search(
-                r"([\d\.]+|[零一二三四五六七八九十百千万亿两]+)\s*(美元|人民币|美金|块)\s*(?:等于多少|换算成|到|转?换成?|是几|等于几)\s*(美元|人民币|美金|块)",
-                text_lower
-            )
-            if money_match:
-                val_raw, from_cur, to_cur = money_match.group(1), money_match.group(2), money_match.group(3)
-                try:
-                    if val_raw.replace(".", "").isdigit():
-                        value = float(val_raw)
-                    else:
-                        value = chinese_to_float(val_raw)
-                except Exception:
-                    return "🤔 金额格式有点怪，请说‘一百人民币等于几美元’试试", "🤔"
-                from_cur = "美元" if from_cur in ("美元", "美金") else "人民币"
-                to_cur = "美元" if to_cur in ("美元", "美金") else "人民币"
-                rate = context.get("exchange_rate", 7.1)
-                if from_cur == "美元" and to_cur == "人民币":
-                    return f"💵 {value} 美元 = {value * rate:.2f} 人民币", "💵"
-                elif from_cur == "人民币" and to_cur == "美元":
-                    return f"💵 {value} 人民币 = {value / rate:.2f} 美元", "💵"
-
-            if "汇率设为" in text_lower:
-                match = re.search(r"汇率设为\s*([\d.]+)", text_lower)
-                if match:
-                    context["exchange_rate"] = float(match.group(1))
-                    return f"✅ 已设定汇率为 {context['exchange_rate']}", "✅"
 
             # === 温度换算 ===
             temp_match = re.search(r"(\d+\.?\d*)\s*(摄氏|华氏)\s*度?\s*(?:等于多少|转?换成?|到)?\s*(摄氏|华氏)\s*度?", text_lower)
@@ -14203,15 +14025,12 @@ class UnifiedAIEngine:
                     "💡 我能做什么？\n"
                     "• 系统控制：打开终端、关机、重启\n"
                     "• 文件管理：打开目录、删除文件、新建文件夹\n"
+                    "• 读取文件：读取 readme.txt\n"
                     "• 翻译词典：苹果英文、翻译苹果\n"
-                    "• 单位换算：1米等于多少厘米（也支持'一米'）\n"
-                    "• 速度换算：英里每小时转公里每小时\n"
+                    "• 单位换算：1米等于多少厘米\n"
                     "• 温度转换：37摄氏等于多少华氏\n"
-                    "• 货币换算：10美元等于多少人民币\n"
                     "• 倒计时提醒：5分钟后提醒我喝水\n"
-                    "• 随机数生成：随机数1到100\n"
                     "• 数学计算：1+2*3\n"
-                    "• 科学计算：sin(30)、sqrt(16)\n"
                     "• 记忆名字：我叫小明"
                 )
                 return help_text, "💡"
@@ -14220,18 +14039,18 @@ class UnifiedAIEngine:
             if re.search(r"(?:我叫啥|我叫什么|我是谁|我叫什么名字|你记得我叫什么)", text_lower):
                 if "name" in context:
                     return f"👤 我记得呀，你叫 {context['name']}！", "😊"
-                return "👤 你还没告诉我你叫什么呢，你可以说‘我叫小明’来让我记住哦。", "👤"
+                return "👤 你还没告诉我你叫什么呢，你可以说'我叫小明'来让我记住哦。", "👤"
 
             name_match = re.search(r"(?:我叫|我的名字是|名字是)[:：\s]*(.+)", original_text)
             if name_match:
                 name = name_match.group(1).strip()
                 if name in ["什么", "啥", "谁"]:
-                    return "👤 咦？你想问自己的名字吗？你可以直接说'我叫小明'来让我记住。", "👤"
+                    return "👤 咦？你想问自己的名字吗？", "👤"
                 context["name"] = name
                 return f"👤 好的，我记住你叫 {name} 了！", "👤"
 
             # === 翻译 ===
-            word_dict = {"苹果": "apple", "香蕉": "banana", "猫": "cat", "狗": "dog", "你好": "hello", "世界": "world", "书": "book", "电脑": "computer", "手机": "phone", "橘子": "orange", "橙子": "orange", "apple": "苹果", "banana": "香蕉", "cat": "猫", "dog": "狗", "hello": "你好", "world": "世界", "book": "书", "computer": "电脑", "phone": "手机", "python": "蟒蛇（编程语言）"}
+            word_dict = {"苹果": "apple", "香蕉": "banana", "猫": "cat", "狗": "dog", "你好": "hello", "世界": "world", "书": "book", "电脑": "computer", "手机": "phone", "apple": "苹果", "banana": "香蕉", "cat": "猫", "dog": "狗", "hello": "你好", "world": "世界", "book": "书", "computer": "电脑", "phone": "手机", "python": "蟒蛇（编程语言）"}
             trans_match = re.search(r"(.+)的(?:英文|中文)", text_lower)
             if not trans_match:
                 trans_match = re.search(r"翻译\s*(.+)", text_lower)
@@ -14247,16 +14066,16 @@ class UnifiedAIEngine:
             # === 情感回复 ===
             if any(w in text_lower for w in ["喜欢", "讨厌", "爱", "恨", "love", "hate", "like", "miss"]):
                 if "hate" in text_lower or "讨厌" in text_lower or "恨" in text_lower:
-                    return "😢 别这么说嘛，我虽然是离线AI，但我会一直帮你运行系统的！", "😢"
+                    return "😢 别这么说嘛！", "😢"
                 else:
-                    return "😆 感情问题我不太懂哦，不过我可以帮你打开终端算个数学题、或者翻译个单词！", "😆"
+                    return "😆 感情问题我不太懂哦！", "😆"
 
             # === 问候 ===
             if any(w in text_lower for w in ["你好", "hi", "hello", "hey"]):
                 return "👋 你好呀！我是 KIKI OS 的离线 AI！", "👋"
 
             if re.match(r"^[a-zA-Z\s\.\,\!\?\']+$", original_text):
-                return "😅 Sorry, I'm an offline AI assistant that mainly understands Chinese. Please ask me in Chinese! (比如：打开终端)", "😅"
+                return "😅 Sorry, I mainly understand Chinese. (比如：打开终端)", "😅"
 
             if hasattr(self.shell, "gui_app") and self.shell.gui_app:
                 all_cmds = list(self.shell.COMMANDS.keys())
@@ -14462,8 +14281,6 @@ class KIKIShell:
             if not self.fs.resolve("/etc", "root"):
                 self.fs.mkdir("/etc", user="root", owner="root", mode=0o755)
 
-            import json
-
             data = {user: pwd.hex() for user, pwd in self.users.items()}
             self.fs.write_file("/etc/passwd", json.dumps(data), "root")
 
@@ -14488,6 +14305,8 @@ class KIKIShell:
         self._apply_ai()
         self.chat = ChatManager(shell=self)
         self.ai_engine = UnifiedAIEngine(self)
+        self._ai_output_target = "terminal"   # "terminal" 或 "chat"
+        self._ai_chat_callback = None         # AI 窗口的回调
         self._register_commands()
         self._load_third_party_apps()
         if "cls" in self._command_registry and "clear" not in self._command_registry:
@@ -21141,9 +20960,29 @@ def register(api):
             if rule.get("type") == "function" and "code" in rule:
                 # 动态定义函数
                 code = rule["code"]
+                # 创建受限代理，只暴露必要的安全方法
+                class SafeShellProxy:
+                    def __init__(self, shell):
+                        self._shell = shell
+                    @property
+                    def username(self):
+                        return self._shell.username
+                    @property
+                    def fs(self):
+                        return self._shell.fs
+                    def read_file(self, path):
+                        return self._shell.fs.read_file(path, self._shell.username)
+                    def write_file(self, path, content):
+                        return self._shell.fs.write_file(path, content, self._shell.username)
+                    def list_dir(self, path):
+                        return self._shell.fs.listdir(path, self._shell.username) or []
+                    def execute_command(self, cmd):
+                        # 这里可以限制只允许白名单命令
+                        return self._shell._execute(cmd)
+
                 namespace = {
                     "__builtins__": __builtins__,
-                    "shell": self,  # 允许访问 shell 对象
+                    "shell": SafeShellProxy(self),  # 受限代理，不暴露整个 shell
                 }
                 try:
                     exec(code, namespace)
@@ -21264,73 +21103,77 @@ def register(api):
         return reply
 
     def _execute_ai_actions(self, actions):
-        """执行AI返回的动作（含自动路径解析与父目录创建）"""
+        """执行AI返回的动作，返回 (成功数, 失败数, 失败消息列表)"""
         username = self.username
         home = f"/home/{username}"
         desktop = f"{home}/Desktop"
+        success_count = 0
+        fail_count = 0
+        fail_msgs = []
 
         def normalize_vfs_path(path, username):
             """将Windows路径或模糊路径转换为VFS绝对路径"""
             if not path:
                 return None
-            # 替换反斜杠为斜杠
             path = path.replace("\\", "/")
-            # 处理 Windows 路径：C:/Users/用户名/Desktop -> /home/用户名/Desktop
+            # Windows 路径：忽略原用户名，映射到当前用户
             if path.lower().startswith("c:/users/"):
                 parts = path.split("/")
-                user = parts[2] if len(parts) > 2 else username
-                parts = [p for p in parts if p and p.lower() not in ("c:", "users")]
-                # 去掉用户名部分（此时 parts[0] 可能是用户名）
-                if parts and parts[0] == user:
-                    parts = parts[1:]
-                # 重建为 /home/user/...
-                return "/home/" + user + ("/" + "/".join(parts) if parts else "")
-            # 如果包含 "desktop" 或 "桌面"，映射到用户桌面
+                if len(parts) >= 3:
+                    remainder = parts[3:] if len(parts) > 3 else []
+                    # 过滤空字符串
+                    remainder = [p for p in remainder if p]
+                    if remainder:
+                        return f"{home}/" + "/".join(remainder)
+                    else:
+                        return home
+                return home
             if "desktop" in path.lower() or "桌面" in path:
                 if path.startswith("/home/"):
                     return path
-                # 去掉可能的 "Desktop" 或 "桌面" 前缀
                 cleaned = re.sub(r'^(desktop|桌面)[/\\]?', '', path, flags=re.IGNORECASE)
                 return f"{desktop}/{cleaned}" if cleaned else desktop
-            # 如果包含 "Documents" 或 "文档"
             if "documents" in path.lower() or "文档" in path:
                 cleaned = re.sub(r'^(documents|文档)[/\\]?', '', path, flags=re.IGNORECASE)
                 return f"{home}/Documents/{cleaned}" if cleaned else f"{home}/Documents"
             return None
 
         def resolve_path(path, default_base=None):
+            """将路径解析为绝对路径（优先当前工作目录，其次默认）"""
             if not path:
-                return default_base or desktop
-            # 规范化 Windows 路径
+                cwd = self.fs.get_abs_path(self.fs.cwd)
+                return cwd if cwd != "/" else home
+            # 先尝试规范化 Windows 路径
             normalized = normalize_vfs_path(path, username)
             if normalized:
                 return normalized
-            # 继续原有逻辑
             path = path.replace("\\", "/")
             if path.startswith("/"):
                 return path
-            if path == "桌面" or path == "Desktop":
+            # 特殊名称
+            if path in ("桌面", "Desktop"):
                 return desktop
-            if path == "我的电脑" or path == "此电脑":
+            if path in ("我的电脑", "此电脑"):
                 return "/"
-            if path == "文档" or path == "Documents":
+            if path in ("文档", "Documents"):
                 return f"{home}/Documents"
-            base = default_base or desktop
+            if path in ("主目录", "home", "~"):
+                return home
+            # 相对路径：优先当前工作目录
+            if default_base is None:
+                cwd = self.fs.get_abs_path(self.fs.cwd)
+                base = cwd if cwd != "/" else home
+            else:
+                base = default_base
             if path.startswith("./"):
                 path = path[2:]
             path = path.rstrip("/")
             if not path:
                 return base
-            if "/" in path:
-                parts = path.split("/")
-                if parts[0] in ("桌面", "Desktop"):
-                    parts[0] = desktop
-                    return "/".join(parts)
-                return f"{base}/{path}"
-            else:
-                return f"{base}/{path}"
+            return f"{base}/{path}"
 
         def ensure_parent_dirs(abs_path):
+            """确保路径的父目录存在"""
             parent = os.path.dirname(abs_path)
             if parent and not self.fs.resolve(parent, username):
                 parts = parent.split("/")
@@ -21351,6 +21194,7 @@ def register(api):
                     path = path.replace("\\", "/")
                     if path in ("terminal", "browser", "ai"):
                         self._execute(path)
+                        success_count += 1
                     else:
                         abs_path = resolve_path(path, default_base="/")
                         node = self.fs.resolve(abs_path, username)
@@ -21359,24 +21203,34 @@ def register(api):
                                 self.gui_app._open_fm_at(abs_path)
                             else:
                                 self._execute(f"dir {abs_path}")
+                            success_count += 1
                         elif node and isinstance(node, File):
                             if hasattr(self, "gui_app") and self.gui_app:
                                 self.gui_app._open_editor_with_file(abs_path)
                             else:
                                 self._execute(f"type {abs_path}")
+                            success_count += 1
                         else:
-                            if hasattr(self, "gui_app") and self.gui_app:
-                                self.gui_app._open_fm_at("/")
+                            self._print_log(f"❌ 打开失败，路径不存在: {abs_path}")
+                            fail_count += 1
+                            fail_msgs.append(f"路径不存在: {abs_path}")
+
                 elif action[0] == "new_folder":
                     folder_name = action[1]
                     abs_path = resolve_path(folder_name)
                     if ensure_parent_dirs(abs_path):
                         if self.fs.mkdir(abs_path, username):
                             self._print_log(f"✅ 创建文件夹成功: {abs_path}")
+                            success_count += 1
                         else:
                             self._print_log(f"❌ 创建文件夹失败: {abs_path}")
+                            fail_count += 1
+                            fail_msgs.append(f"创建文件夹失败: {abs_path}")
                     else:
                         self._print_log(f"❌ 创建文件夹失败（父目录无法创建）: {abs_path}")
+                        fail_count += 1
+                        fail_msgs.append(f"创建文件夹失败（父目录无法创建）: {abs_path}")
+
                 elif action[0] == "new_file":
                     file_path = action[1]
                     content = action[2] if len(action) > 2 else ""
@@ -21384,10 +21238,16 @@ def register(api):
                     if ensure_parent_dirs(abs_path):
                         if self.fs.create_file(abs_path, content, username):
                             self._print_log(f"✅ 创建文件成功: {abs_path}")
+                            success_count += 1
                         else:
                             self._print_log(f"❌ 创建文件失败: {abs_path}")
+                            fail_count += 1
+                            fail_msgs.append(f"创建文件失败: {abs_path}")
                     else:
                         self._print_log(f"❌ 创建文件失败（父目录无法创建）: {abs_path}")
+                        fail_count += 1
+                        fail_msgs.append(f"创建文件失败（父目录无法创建）: {abs_path}")
+
                 elif action[0] == "write_file":
                     file_path = action[1]
                     content = action[2] if len(action) > 2 else ""
@@ -21395,10 +21255,16 @@ def register(api):
                     if ensure_parent_dirs(abs_path):
                         if self.fs.write_file(abs_path, content, username):
                             self._print_log(f"✅ 写入文件成功: {abs_path}")
+                            success_count += 1
                         else:
                             self._print_log(f"❌ 写入文件失败: {abs_path}")
+                            fail_count += 1
+                            fail_msgs.append(f"写入文件失败: {abs_path}")
                     else:
                         self._print_log(f"❌ 写入文件失败（父目录无法创建）: {abs_path}")
+                        fail_count += 1
+                        fail_msgs.append(f"写入文件失败（父目录无法创建）: {abs_path}")
+
                 elif action[0] == "rename":
                     old_path = action[1]
                     new_name = action[2]
@@ -21407,18 +21273,28 @@ def register(api):
                     abs_new = f"{parent}/{new_name}" if parent != "/" else f"/{new_name}"
                     if self.fs.move(abs_old, abs_new, username):
                         self._print_log(f"✅ 重命名成功: {abs_old} -> {abs_new}")
+                        success_count += 1
                     else:
                         self._print_log(f"❌ 重命名失败: {abs_old}")
+                        fail_count += 1
+                        fail_msgs.append(f"重命名失败: {abs_old}")
+
                 elif action[0] == "delete":
                     path = action[1]
                     abs_path = resolve_path(path)
                     if self.fs.move_to_trash(abs_path, username)[0]:
                         self._print_log(f"🗑️ 删除成功: {abs_path}")
+                        success_count += 1
                     else:
                         self._print_log(f"❌ 删除失败: {abs_path}")
+                        fail_count += 1
+                        fail_msgs.append(f"删除失败: {abs_path}")
+
                 elif action[0] == "empty_trash":
                     self.fs.empty_trash(username)
                     self._print_log("♻️ 回收站已清空")
+                    success_count += 1
+
                 elif action[0] == "move":
                     src, dst = action[1], action[2]
                     abs_src = resolve_path(src)
@@ -21430,10 +21306,16 @@ def register(api):
                     if ensure_parent_dirs(abs_dst):
                         if self.fs.move(abs_src, abs_dst, username):
                             self._print_log(f"📦 移动成功: {abs_src} -> {abs_dst}")
+                            success_count += 1
                         else:
                             self._print_log(f"❌ 移动失败: {abs_src} -> {abs_dst}")
+                            fail_count += 1
+                            fail_msgs.append(f"移动失败: {abs_src} -> {abs_dst}")
                     else:
                         self._print_log(f"❌ 移动失败（父目录无法创建）: {abs_dst}")
+                        fail_count += 1
+                        fail_msgs.append(f"移动失败: {abs_dst}")
+
                 elif action[0] == "copy":
                     src, dst = action[1], action[2]
                     abs_src = resolve_path(src)
@@ -21445,10 +21327,16 @@ def register(api):
                     if ensure_parent_dirs(abs_dst):
                         if self.fs.copy(abs_src, abs_dst, username):
                             self._print_log(f"📋 复制成功: {abs_src} -> {abs_dst}")
+                            success_count += 1
                         else:
                             self._print_log(f"❌ 复制失败: {abs_src} -> {abs_dst}")
+                            fail_count += 1
+                            fail_msgs.append(f"复制失败: {abs_src} -> {abs_dst}")
                     else:
                         self._print_log(f"❌ 复制失败（父目录无法创建）: {abs_dst}")
+                        fail_count += 1
+                        fail_msgs.append(f"复制失败: {abs_dst}")
+
                 elif action[0] == "cd":
                     path = action[1]
                     abs_path = resolve_path(path, default_base=home)
@@ -21456,48 +21344,110 @@ def register(api):
                     if node and isinstance(node, Directory):
                         self.fs.cwd = node
                         self._print_log(f"📂 切换到目录: {abs_path}")
+                        success_count += 1
                     else:
                         self._print_log(f"❌ 目录不存在: {abs_path}")
+                        fail_count += 1
+                        fail_msgs.append(f"目录不存在: {abs_path}")
+
                 elif action[0] == "list_dir":
-                    self._execute("dir")
+                    cwd = self.fs.get_abs_path(self.fs.cwd)
+                    items = self.fs.listdir(cwd, username) or []
+                    if items:
+                        self._print_log(f"📂 {cwd} 下的内容:\n" + "\n".join(sorted(items)))
+                    else:
+                        self._print_log(f"📂 {cwd}（空目录）")
+                    success_count += 1
+
                 elif action[0] == "execute":
-                    self._execute(action[1])
+                    cmd = action[1]
+                    # 捕获命令输出，通过 _print_log 路由到正确位置
+                    import io
+                    from contextlib import redirect_stdout, redirect_stderr
+                    out_buf = io.StringIO()
+                    err_buf = io.StringIO()
+                    try:
+                        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                            self._execute(cmd)
+                        output = out_buf.getvalue() + err_buf.getvalue()
+                        if output:
+                            self._print_log(output)
+                        success_count += 1
+                    except Exception as e:
+                        self._print_log(f"❌ 命令执行失败: {e}")
+                        fail_count += 1
+                        fail_msgs.append(f"命令执行失败: {e}")
+
                 elif action[0] == "read_file":
                     path = action[1]
                     abs_path = resolve_path(path)
+                    node = self.fs.resolve(abs_path, username)
+                    # 若找不到，尝试常见位置
+                    if node is None and not path.startswith("/"):
+                        cwd = self.fs.get_abs_path(self.fs.cwd)
+                        for cand in [f"{cwd}/{path}", f"{home}/{path}",
+                                     f"{home}/Documents/{path}", f"{desktop}/{path}"]:
+                            cand = cand.replace("//", "/")
+                            n = self.fs.resolve(cand, username)
+                            if n:
+                                abs_path = cand
+                                node = n
+                                break
                     content = self.fs.read_file(abs_path, username)
                     if content is not None:
                         self._print_log(content)
+                        success_count += 1
                     else:
                         self._print_log(f"❌ 文件不存在: {abs_path}")
+                        fail_count += 1
+                        fail_msgs.append(f"文件不存在: {abs_path}")
+
                 elif action[0] == "search_file":
                     keyword = action[1]
                     items = self.fs.listdir(self.fs.get_abs_path(self.fs.cwd), username) or []
                     matches = [i for i in items if keyword.lower() in i.lower()]
-                    self._print_log("\n".join(matches) if matches else "未找到文件")
+                    if matches:
+                        self._print_log("\n".join(matches))
+                        success_count += 1
+                    else:
+                        self._print_log(f"未找到匹配 '{keyword}' 的文件")
+                        fail_count += 1
+                        fail_msgs.append(f"未找到匹配 '{keyword}' 的文件")
+
                 else:
                     self._print_log(f"未知动作: {action}")
+                    fail_count += 1
+                    fail_msgs.append(f"未知动作: {action}")
             except Exception as e:
                 self._print_log(f"执行动作失败: {action} - {e}")
+                fail_count += 1
+                fail_msgs.append(f"{action} - {e}")
 
+        return success_count, fail_count, fail_msgs
+    
     def _print_log(self, msg):
-        """安全输出到GUI终端或控制台，避免 tkinter 错误"""
+        """根据当前 AI 输出目标选择打印位置"""
         try:
+            if self._ai_output_target == "chat" and self._ai_chat_callback:
+                # 发送到 AI 聊天窗口
+                try:
+                    self._ai_chat_callback(msg)
+                except Exception:
+                    pass
+                return
+            # 默认输出到终端
             if hasattr(self, "gui_app") and self.gui_app and self.gui_app.winfo_exists():
-                # 检查 term 控件是否存在且有效
                 if hasattr(self.gui_app, "term") and self.gui_app.term.winfo_exists():
                     self.gui_app.term.configure(state="normal")
                     self.gui_app.term.insert("end", msg + "\n")
                     self.gui_app.term.see("end")
                     self.gui_app.term.configure(state="disabled")
-                else:
-                    print(msg)
-            else:
-                print(msg)
+                    return
+            print(msg)
         except Exception:
             try:
                 print(msg)
-            except:
+            except Exception:
                 pass
 
     def _ensure_parent_dirs(self, path, user):
@@ -21536,8 +21486,8 @@ def register(api):
                     if self._confirm_import(mod):
                         allowed.append(mod)
             # ===== 复制当前 VFS 目录到临时目录 =====
-            import tempfile
             import shutil
+            import tempfile
             vfs_cwd = self.fs.get_abs_path(self.fs.cwd)
             temp_cwd = tempfile.mkdtemp(prefix="kiki_sandbox_")
             # 复制 VFS 当前目录下的所有文件（简单遍历）
@@ -21573,7 +21523,6 @@ def register(api):
                 p.join()
                 error += "\n⚠️ 沙盒执行超时，已被强制终止。"
             # 清理临时目录
-            import shutil
             shutil.rmtree(temp_cwd, ignore_errors=True)
             # 输出结果
             if output:
@@ -26268,6 +26217,15 @@ class KIKIGUI(ctk.CTk):
                     pass
                 btn._delete_btn = None
 
+    def _pulse_button(self, btn):
+        if hasattr(btn, "pulse_animation"):
+            btn.pulse_animation()
+        else:
+            # 如果没有动画类，用简单缩放
+            original = btn.cget("width")
+            btn.configure(width=original+4)
+            btn.after(100, lambda: btn.configure(width=original))
+
     def _create_desktop_icons(self):
         """创建桌面图标：固定图标 + 动态快捷方式"""
         for child in self.icon_frame.winfo_children():
@@ -26307,13 +26265,13 @@ class KIKIGUI(ctk.CTk):
         for idx, (icon, label, cmd) in enumerate(fixed_icons):
             icon_id = f"fixed_{label}"
             if icon_id in self.desktop_icon_positions:
-                x, y = self.desktop_icon_positions[icon_id]
-                # 仅做边界检查，不做网格判断
-                x = max(0, min(x, self.icon_frame.winfo_width() - self.icon_size))
-                y = max(0, min(y, self.icon_frame.winfo_height() - self.icon_size))
+                saved_x, saved_y = self.desktop_icon_positions[icon_id]
+                if (saved_x - 20) % self.icon_grid_x == 0 and (saved_y - 20) % self.icon_grid_y == 0:
+                    x, y = saved_x, saved_y
+                else:
+                    x, y = 20, 20 + idx * 90
             else:
-                x = 20
-                y = 20 + idx * 90
+                x, y = 20, 20 + idx * 90
 
             btn = ctk.CTkButton(
                 self.icon_frame,
@@ -26414,16 +26372,11 @@ class KIKIGUI(ctk.CTk):
             if x is None or y is None:
                 x, y = 20, 20
 
-        # 网格对齐（确保 x, y 在网格上）
-        grid_x = self.icon_grid_x
-        grid_y = self.icon_grid_y
-        origin_x = 20
-        origin_y = 20
-        x = max(0, min(round((x - origin_x) / grid_x) * grid_x + origin_x, self.icon_frame.winfo_width() - self.icon_size))
-        y = max(0, min(round((y - origin_y) / grid_y) * grid_y + origin_y, self.icon_frame.winfo_height() - self.icon_size))
-
+        # 仅做边界检查，不再网格对齐
         if x < 0: x = 20
         if y < 0: y = 20
+        x = max(0, min(x, self.icon_frame.winfo_width() - self.icon_size))
+        y = max(0, min(y, self.icon_frame.winfo_height() - self.icon_size))
 
         icon_id = f"dynamic_{self.dynamic_icon_counter}"
         self.dynamic_icon_counter += 1
@@ -27831,7 +27784,6 @@ class KIKIGUI(ctk.CTk):
     def _update_dock_battery(self):
         try:
             import psutil
-
             battery = psutil.sensors_battery()
             if battery is None:
                 self.dock_battery.configure(text="🔋 无电池")
@@ -27839,10 +27791,48 @@ class KIKIGUI(ctk.CTk):
             percent = battery.percent
             charging = battery.power_plugged
             icon = "⚡" if charging else "🔋"
-            color = "#ff4444" if percent < 15 else "#d4d4d8"
-            self.dock_battery.configure(text=f"{icon} {percent}%", text_color=color)
+            # 低电量闪烁
+            if percent < 15 and not charging:
+                self._blink_icon(self.dock_battery, True)
+            else:
+                self._blink_icon(self.dock_battery, False)
+            self.dock_battery.configure(text=f"{icon} {percent}%", text_color="#ffffff")
         except Exception:
             self.dock_battery.configure(text="🔋 --%")
+
+    def _blink_icon(self, widget, blinking):
+        """闪烁图标（低电量等）"""
+        if blinking:
+            # 避免重复启动
+            if hasattr(widget, "_blink_id") and widget._blink_id:
+                return
+            def toggle():
+                if not widget.winfo_exists():
+                    return
+                current = widget.cget("text_color")
+                widget.configure(text_color="#ff4444" if current == "#ffffff" else "#ffffff")
+                widget._blink_id = widget.after(500, toggle)
+            widget._blink_id = widget.after(500, toggle)
+        else:
+            if hasattr(widget, "_blink_id") and widget._blink_id:
+                try:
+                    widget.after_cancel(widget._blink_id)
+                except Exception:
+                    pass
+                widget._blink_id = None
+                widget.configure(text_color="#ffffff")
+
+    def _pulse_dock_btn(self, btn):
+        """Dock 按钮脉冲动画（快速放大缩小）"""
+        try:
+            original_w = btn.cget("width")
+            original_h = btn.cget("height")
+            # 放大
+            btn.configure(width=original_w + 6, height=original_h + 6)
+            # 80ms 后恢复
+            btn.after(80, lambda: btn.configure(width=original_w, height=original_h))
+        except Exception:
+            pass
 
     def _toggle_volume(self):
         if hasattr(self, "vol_win") and self.vol_win is not None and self.vol_win.winfo_exists():
@@ -29049,16 +29039,13 @@ class KIKIGUI(ctk.CTk):
 
     def _update_dock(self):
         """刷新 Dock 栏（回退到 CTkButton，禁用原生悬停 + 手动控制颜色）"""
-        # 确保 Dock 栏存在，如果不存在则重新创建
         try:
             if not hasattr(self, "dock_bg") or not self.dock_bg.winfo_exists():
                 self._make_dock()
             else:
-                # 如果存在但被隐藏，重新放置
                 self.dock_bg.place(relx=0.5, rely=1.0, anchor="s", y=-28)
                 self.dock_bg.lift()
         except Exception:
-            # 如果出错，也尝试重新创建
             try:
                 self._make_dock()
             except Exception:
@@ -29069,11 +29056,9 @@ class KIKIGUI(ctk.CTk):
         if not hasattr(self, "dock_left") or not self.dock_left.winfo_exists():
             return
 
-        # 1. 暴力清空左侧所有子组件
         for child in self.dock_left.winfo_children():
             child.destroy()
 
-        # ---- 收集窗口与固定应用（与原逻辑一致，无改动） ----
         seen_windows = set()
         open_windows = []
         if self.workspace_manager and self.workspace_manager.winfo_exists():
@@ -29113,31 +29098,26 @@ class KIKIGUI(ctk.CTk):
         all_items = []
         for win_type, data in pinned_but_closed:
             label = self._get_pinned_label(win_type, data)
-            all_items.append(
-                {
-                    "type": "pinned",
-                    "label": label,
-                    "win_type": win_type,
-                    "data": data,
-                    "window": None,
-                }
-            )
+            all_items.append({
+                "type": "pinned",
+                "label": label,
+                "win_type": win_type,
+                "data": data,
+                "window": None,
+            })
         for win in open_windows:
             title = win.title() if hasattr(win, "title") else "窗口"
             is_minimized = not win.winfo_ismapped()
             label = f"⏺ {title}" if is_minimized else title
-            all_items.append(
-                {
-                    "type": "window",
-                    "label": label,
-                    "win_type": None,
-                    "data": None,
-                    "window": win,
-                    "is_minimized": is_minimized,
-                }
-            )
+            all_items.append({
+                "type": "window",
+                "label": label,
+                "win_type": None,
+                "data": None,
+                "window": win,
+                "is_minimized": is_minimized,
+            })
 
-        # ---- 计算图标尺寸 ----
         screen_width = self.winfo_screenwidth()
         right_buttons_width = 120
         available_width = screen_width - 40 - right_buttons_width
@@ -29146,7 +29126,6 @@ class KIKIGUI(ctk.CTk):
         font_size = max(10, min(14, icon_width // 4))
         self.dock_icon_width = icon_width
 
-        # ---- 布局设定 ----
         self.dock_leftmost.pack_configure(padx=(6, 0))
         self.dock_right.pack_configure(padx=(2, 6))
         self.dock_left.pack(side="left", padx=(2, 2), pady=4)
@@ -29162,7 +29141,6 @@ class KIKIGUI(ctk.CTk):
             self.dock.update_idletasks()
             return
 
-        # ---- 核心变化：使用 CTkButton + 禁用原生悬停 ----
         for item in all_items:
             btn = ctk.CTkButton(
                 self.dock_left,
@@ -29171,19 +29149,17 @@ class KIKIGUI(ctk.CTk):
                 height=icon_width,
                 corner_radius=12,
                 fg_color="transparent",
-                hover=False,  # 🔥 关键：禁用原生 hover，彻底解决闪烁
+                hover=False,
                 font=("Segoe UI", font_size),
             )
             btn.pack(side="left", padx=3, pady=3)
 
-            # 手动为最小化窗口添加边框
             if item["type"] == "window" and not item.get("is_minimized"):
                 try:
                     btn.configure(border_width=2, border_color="#66aaff")
                 except Exception:
                     pass
 
-            # 🔥 手动绑定 Hover 颜色，绝不闪烁
             def _hover_enter(e, b=btn):
                 b.configure(fg_color="#4a9eff", text_color="#ffffff")
 
@@ -29193,36 +29169,23 @@ class KIKIGUI(ctk.CTk):
             btn.bind("<Enter>", _hover_enter)
             btn.bind("<Leave>", _hover_leave)
 
-            # 绑定操作
             if item["type"] == "window":
                 btn.configure(command=lambda w=item["window"]: self._focus_window(w))
                 btn.bind(
                     "<Button-3>",
                     lambda e, w=item["window"], b=btn: self._show_dock_window_menu(e, w, b),
                 )
-                # ---------- 直接显示预览（无延迟） ----------
-                btn.bind(
-                    "<Enter>",
-                    lambda e, w=item["window"], b=btn: self._show_taskbar_preview(e, w, b)
-                )
-                btn.bind(
-                    "<Leave>",
-                    lambda e: self._schedule_hide_taskbar_preview()
-                )
+                btn.bind("<Enter>", lambda e, w=item["window"], b=btn: self._show_taskbar_preview(e, w, b))
+                btn.bind("<Leave>", lambda e: self._schedule_hide_taskbar_preview())
             else:
                 btn.configure(
-                    command=lambda t=item["win_type"], d=item["data"]: self._open_pinned_window(
-                        t, d
-                    )
+                    command=lambda t=item["win_type"], d=item["data"]: self._open_pinned_window(t, d)
                 )
                 btn.bind(
                     "<Button-3>",
-                    lambda e, t=item["win_type"], d=item["data"]: self._show_dock_pinned_menu(
-                        e, t, d
-                    ),
+                    lambda e, t=item["win_type"], d=item["data"]: self._show_dock_pinned_menu(e, t, d),
                 )
 
-        # ---- 执行两次刷新，确保物理渲染 ----
         self.dock.update_idletasks()
         self.dock_left.update_idletasks()
 
@@ -29282,8 +29245,7 @@ class KIKIGUI(ctk.CTk):
         btn_y = btn.winfo_rooty()
         preview_x = btn_x + (btn.winfo_width() - new_w) // 2
         preview_y = btn_y - new_h - 8
-        if preview_y < 0:
-            preview_y = 0
+        preview_y = max(preview_y, 0)
         self._taskbar_preview_win.geometry(f"{new_w}x{new_h}+{preview_x}+{preview_y}")
         self._taskbar_preview_win.lift()
 
@@ -29322,6 +29284,7 @@ class KIKIGUI(ctk.CTk):
         try:
             import ctypes
             from ctypes import wintypes
+
             from PIL import Image
 
             user32 = ctypes.windll.user32
@@ -32055,6 +32018,12 @@ class AIChatWindow(KikiWindow):
         self.chat_display.configure(state="disabled")
         if self.speak_enabled:
             self.ai_engine.speak(reply)
+
+    def destroy(self):
+        if self.ai_engine:
+            self.ai_engine.reply_callback = None
+            self.ai_engine.thinking_callback = None
+        super().destroy()
 
 
 import os
