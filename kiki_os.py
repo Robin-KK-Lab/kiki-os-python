@@ -15210,7 +15210,7 @@ class KIKIShell:
         except Exception as e:
             print(f"❌ 无法打开: {e}")
 
-    @command("weather", "tools", "查询实时天气（需要 API Key）")
+    @command("weather", "tools", "查询实时天气（无需 API Key）")
     def weather_cmd(self, args, src=None):
         """weather <城市名> - 查询天气"""
         if hasattr(self, "gui_app") and self.gui_app:
@@ -15218,52 +15218,42 @@ class KIKIShell:
             self.gui_app._add_window(win)
             return
 
-        import datetime
-
-        import requests
-
         if not args:
             print("用法: weather <城市名>")
             print("示例: weather Beijing")
             return
 
-        Api_key = "2154faddb71353e0e8e2b62421209689"
-        base_url = "http://api.openweathermap.org/data/2.5/weather"
+        import requests
         city = args.strip()
-
         try:
-            request_url = f"{base_url}?appid={Api_key}&q={city}"
-            response = requests.get(request_url, timeout=10)
+            url = f"https://wttr.in/{city}"
+            params = {"format": "j1", "lang": "zh"}
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code != 200:
+                print(f"❌ 查询失败: HTTP {r.status_code}")
+                return
+            data = r.json()
+            cur = data["current_condition"][0]
+            area = data.get("nearest_area", [{}])[0]
+            city_name = area.get("areaName", [{}])[0].get("value", city)
+            country = area.get("country", [{}])[0].get("value", "")
+            desc = cur.get("lang_zh", [{}])[0].get("value") or cur["weatherDesc"][0]["value"]
+            temp = cur["temp_C"]
+            feels = cur["FeelsLikeC"]
+            humidity = cur["humidity"]
+            wind = cur["windspeedKmph"]
 
-            if response.status_code == 200:
-                data = response.json()
-                weather = data["weather"][0]["description"]
-                country = data["sys"]["country"]
-                humidity = data["main"]["humidity"]
-                unix_sunrise_pre = data["sys"]["sunrise"]
-                unix_sunset_pre = data["sys"]["sunset"]
-                unix_sunrise = datetime.datetime.fromtimestamp(unix_sunrise_pre).strftime(
-                    "%H:%M:%S"
-                )
-                unix_sunset = datetime.datetime.fromtimestamp(unix_sunset_pre).strftime("%H:%M:%S")
-                temperature = round(data["main"]["temp"] - 273.15, 2)
-
-                output = f"""
-📍 {city}, {country}
-🌤️ 天气: {weather}
-🌡️ 温度: {temperature}°C
+            print(f"""
+📍 {city_name}, {country}
+🌤️ 天气: {desc}
+🌡️ 温度: {temp}°C (体感 {feels}°C)
 💧 湿度: {humidity}%
-🌅 日出: {unix_sunrise}
-🌇 日落: {unix_sunset}
-"""
-                if hasattr(self, "gui_app") and self.gui_app:
-                    self.gui_app._print(output)
-                else:
-                    print(output)
-            else:
-                print(f"❌ 查询失败: {response.status_code}")
+💨 风速: {wind} km/h
+""")
         except requests.exceptions.RequestException as e:
             print(f"❌ 网络错误: {e}")
+        except Exception as e:
+            print(f"❌ 解析失败: {e}")
 
     @command("fm", "files", "打开图形文件管理器")
     def fm_cmd(self, args, src=None):
@@ -32482,27 +32472,27 @@ class WeatherWindow(KikiWindow):
 
     def _query(self, city):
         import requests
-
-        api_key = self.shell.config.get("weather.api_key", "2154faddb71353e0e8e2b62421209689")
         try:
             r = requests.get(
-                f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}",
-                timeout=5,
+                f"https://wttr.in/{city}",
+                params={"format": "j1", "lang": "zh"},
+                timeout=10,
             )
-            if r.status_code == 200:
-                d = r.json()
-                t = round(d["main"]["temp"] - 273.15, 1)
-                desc = d["weather"][0]["description"]
-                self.weather_label.configure(text=f"🌤 {desc}")
-                self.temp_label.configure(text=f"温度: {t}°C")
-                self.detail_label.configure(
-                    text=f"湿度: {d['main']['humidity']}%  风速: {d['wind']['speed']}m/s"
-                )
-            else:
-                self.weather_label.configure(text="❌ 查询失败")
+            if r.status_code != 200:
+                self.weather_label.configure(text=f"❌ 查询失败: HTTP {r.status_code}")
+                return
+            data = r.json()
+            cur = data["current_condition"][0]
+            desc = cur.get("lang_zh", [{}])[0].get("value") or cur["weatherDesc"][0]["value"]
+            t = cur["temp_C"]
+            h = cur["humidity"]
+            w = cur["windspeedKmph"]
+            self.weather_label.configure(text=f"🌤 {desc}")
+            self.temp_label.configure(text=f"温度: {t}°C")
+            self.detail_label.configure(text=f"湿度: {h}%  风速: {w}km/h")
         except Exception as e:
             self.weather_label.configure(text=f"错误: {e}")
-
+            
 
 class PingWindow(KikiWindow):
     def __init__(self, master, shell):
