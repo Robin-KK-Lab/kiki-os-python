@@ -1,14 +1,4 @@
 import ctypes
-
-try:
-    # Windows 8.1+ 的 DPI 感知声明
-    ctypes.windll.shcore.SetProcessDpiAwareness(1)
-except Exception:
-    try:
-        # Windows Vista/7 的回退声明
-        ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        pass
 import ast
 import asyncio
 import base64
@@ -127,6 +117,8 @@ except ImportError:
 KIKI_DATA_DIR = os.path.join(os.path.expanduser("~"), ".kiki_os")
 os.makedirs(KIKI_DATA_DIR, exist_ok=True)
 
+KIKI_VERSION = "9.0"
+
 # 日志配置
 log_path = os.path.join(KIKI_DATA_DIR, "kiki_error.log")
 logging.basicConfig(
@@ -183,6 +175,113 @@ try:
 except ImportError:
     COLORAMA_AVAILABLE = False
 
+
+# ============================================================
+# 修复 CTk 的 TclError：控件销毁后 after 回调还在触发
+# ============================================================
+try:
+    import customtkinter.windows.widgets.core_widget_classes.ctk_base_class as _ctk_base
+    import tkinter as _tk
+
+    _orig_update_dimensions = _ctk_base.CTkBaseClass._update_dimensions_event
+
+    def _safe_update_dimensions_event(self, event):
+        try:
+            # 检查控件是否还存在
+            if not self.winfo_exists():
+                return
+            _orig_update_dimensions(self, event)
+        except _tk.TclError:
+            pass
+        except Exception:
+            pass
+
+    _ctk_base.CTkBaseClass._update_dimensions_event = _safe_update_dimensions_event
+except Exception:
+    pass
+
+
+# ============================================================
+# 浏览器引擎探测（Qt 系列 + tkinterweb）
+# ============================================================
+QT_LIB = None
+HAS_QTWEBENGINE = False      # 是否有 QtWebEngineWidgets
+HAS_QTWEBENGINE_ADDONS = False  # 是否有 QtWebEngine 附加组件
+QT_DIAGNOSIS = ""            # 诊断信息
+
+# 1) 试 PyQt5
+try:
+    from PyQt5.QtCore import Qt, QUrl
+    from PyQt5.QtWidgets import (
+        QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+        QLineEdit, QToolButton, QTabWidget, QSizePolicy,
+    )
+    QT_LIB = "PyQt5"
+
+    # 核心 WebEngine
+    try:
+        from PyQt5.QtWebEngineWidgets import QWebEnginePage, QWebEngineView
+        HAS_QTWEBENGINE = True
+        # 附加组件检测
+        try:
+            from PyQt5.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
+            from PyQt5.QtWebChannel import QWebChannel
+            HAS_QTWEBENGINE_ADDONS = True
+        except ImportError as e:
+            QT_DIAGNOSIS = f"PyQt5 附加组件缺失: {e}"
+    except ImportError as e:
+        QT_DIAGNOSIS = f"PyQt5 缺 QtWebEngineWidgets: 请 pip install PyQtWebEngine"
+except ImportError:
+    # 2) 试 PySide6
+    try:
+        from PySide6.QtCore import Qt, QUrl
+        from PySide6.QtWidgets import (
+            QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+            QLineEdit, QToolButton, QTabWidget, QSizePolicy,
+        )
+        QT_LIB = "PySide6"
+
+        try:
+            from PySide6.QtWebEngineWidgets import QWebEnginePage, QWebEngineView
+            HAS_QTWEBENGINE = True
+            try:
+                from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
+                from PySide6.QtWebChannel import QWebChannel
+                HAS_QTWEBENGINE_ADDONS = True
+            except ImportError as e:
+                QT_DIAGNOSIS = f"PySide6 附加组件缺失: {e}"
+        except ImportError as e:
+            QT_DIAGNOSIS = f"PySide6 缺 QtWebEngineWidgets: 请 pip install PySide6-Addons"
+    except ImportError:
+        QT_LIB = None
+        QT_DIAGNOSIS = "未安装 PyQt5 或 PySide6"
+
+# 3) tkinterweb 兜底（轻量级）
+try:
+    import tkinterweb
+    HAS_WEBVIEW = True
+except ImportError:
+    HAS_WEBVIEW = False
+
+
+def browser_engine_status():
+    """返回一个人类可读的浏览器引擎状态（纯函数，不 print）。"""
+    lines = []
+    lines.append(f"Qt 库: {QT_LIB or '未安装'}")
+    lines.append(f"QtWebEngine: {'✅' if HAS_QTWEBENGINE else '❌'}")
+    lines.append(f"QtWebEngine 附加组件: {'✅' if HAS_QTWEBENGINE_ADDONS else '❌'}")
+    if QT_DIAGNOSIS:
+        lines.append(f"诊断: {QT_DIAGNOSIS}")
+    lines.append(f"tkinterweb 兜底: {'✅' if HAS_WEBVIEW else '❌'}")
+    if QT_LIB and HAS_QTWEBENGINE and HAS_QTWEBENGINE_ADDONS:
+        lines.append("结论: ✅ 完整 Qt 浏览器可用")
+    elif HAS_WEBVIEW:
+        lines.append("结论: ⚠️ 只能使用 tkinterweb 轻量浏览器")
+    else:
+        lines.append("结论: ❌ 无可用的浏览器引擎")
+    return "\n".join(lines)
+
+
 # 命令注册装饰器
 _command_registry = {}
 
@@ -203,6 +302,11 @@ class DummyColor:
 
 # 持久化存储文件
 PERSIST_FILE = os.path.join(KIKI_DATA_DIR, "kiki_data.dat")
+
+
+# 你发现了最深的彩蛋
+# if (x == x || x != x) {
+# }
 
 
 # ===== 动画辅助类 =====
@@ -290,6 +394,92 @@ class CTkAnimatedButton(ctk.CTkButton):
         self.after(200, lambda: self._animate(self._base_w, self._base_h, 100, Easing.ease_in_out_quad))
 
 
+def _make_safe_os():
+    """
+    返回一个 os 模块的代理对象：
+    - 只读操作（listdir / path / stat / getcwd / environ 读）直接放行
+    - 写/执行/进程操作（system / popen / remove / chmod / fork ...）被 stub 拦截
+    """
+    import io as _io
+    import os as _real_os
+
+    # 会改变宿主机状态或执行外部程序的函数
+    DANGEROUS = {
+        # 进程执行
+        "system", "popen", "popen2", "popen3", "popen4",
+        "spawnl", "spawnle", "spawnlp", "spawnlpe",
+        "spawnv", "spawnve", "spawnvp", "spawnvpe",
+        "execl", "execle", "execlp", "execlpe",
+        "execv", "execve", "execvp", "execvpe",
+        "fork", "forkpty", "kill", "killpg",
+        "abort", "startfile",
+        # 文件系统写
+        "remove", "unlink", "rmdir", "removedirs",
+        "mkdir", "makedirs", "rename", "renames", "replace",
+        "chmod", "chown", "lchmod", "lchown",
+        "link", "symlink", "truncate",
+        # 环境变量写
+        "putenv", "unsetenv",
+    }
+
+    class SafeOS:
+        """沙盒化的 os 模块代理"""
+
+        def __getattr__(self, name):
+            if name in DANGEROUS:
+                def blocker(*args, **kwargs):
+                    # 打印拦截日志，返回"失败"结果
+                    try:
+                        print(f"[沙盒] 已拦截 os.{name}({args!r})")
+                    except Exception:
+                        pass
+                    # 按函数名给合理的失败返回值
+                    if name in ("popen", "popen2", "popen3", "popen4"):
+                        return _io.StringIO("")     # 读出来是空字符串
+                    if name == "system":
+                        return 1                    # 非 0 = 失败
+                    return None
+                return blocker
+
+            # 只读操作直接放行（getattr 会拿到真正的 os 属性）
+            return getattr(_real_os, name)
+
+        def __dir__(self):
+            return dir(_real_os)
+
+    return SafeOS()
+
+
+def _make_safe_subprocess():
+    """
+    返回一个 subprocess 模块的代理对象：
+    所有执行类函数（Popen / run / call / check_output）都被 stub，
+    返回假的 CompletedProcess，不会真的执行命令。
+    """
+    class _FakeCompleted:
+        returncode = 1
+        stdout = ""
+        stderr = "[沙盒] subprocess 已被拦截"
+
+    class SafeSubprocess:
+        def __getattr__(self, name):
+            def blocker(*args, **kwargs):
+                try:
+                    print(f"[沙盒] 已拦截 subprocess.{name}({args!r})")
+                except Exception:
+                    pass
+                if name in ("run", "call", "check_call", "check_output"):
+                    return _FakeCompleted()
+                if name == "Popen":
+                    return None
+                return None
+            return blocker
+
+        def __dir__(self):
+            return []
+
+    return SafeSubprocess()
+
 
 # ==================== 沙盒环境工厂函数 ====================
 
@@ -354,20 +544,25 @@ def _create_sandbox_env(use_restricted_open=True, shell=None, allowed_modules=No
             raise PermissionError(f"沙盒禁止访问 {file} (不在临时目录中)")
         return open(file, mode, buffering, encoding, errors, newline, closefd, opener)
 
-    # 安全导入
+    # 安全导入 —— 允许导入 os/subprocess，但危险函数被 stub 掉
     def safe_import(name, *args, **kwargs):
-        # 危险模块
-        if name in ("os", "subprocess", "builtins", "ctypes", "socket",
-                    "select", "signal", "multiprocessing", "threading",
-                    "pty", "tty", "termios", "winreg"):
+        # 真正禁止的模块（泄露底层能力，无法安全包装）
+        if name in ("ctypes", "multiprocessing", "pty", "tty", "termios", "winreg"):
             raise ImportError(f"沙盒禁止导入: {name}")
+
+        # 允许导入但需要包装的模块
+        if name == "os" or name.startswith("os."):
+            return _make_safe_os()
+        if name == "subprocess" or name.startswith("subprocess."):
+            return _make_safe_subprocess()
         if name == "sys":
             return safe_sys
+
+        # 白名单 + 允许列表直接放行
         base_name = name.split(".")[0]
-        # 白名单 + 允许列表
         if base_name in SAFE_MODULES or base_name in allowed_modules:
             return __import__(name, *args, **kwargs)
-        # 未白名单且未允许 → 拒绝
+
         raise ImportError(f"沙盒禁止导入未白名单模块: {name}")
 
     # eval/exec
@@ -385,18 +580,44 @@ def _create_sandbox_env(use_restricted_open=True, shell=None, allowed_modules=No
             globals["__builtins__"] = safe_builtins
         exec(code, globals, locals)
 
+    import builtins as _builtins
+
     safe_builtins = {
-        "print": print, "len": len, "range": range, "list": list,
-        "dict": dict, "tuple": tuple, "set": set, "str": str,
-        "int": int, "float": float, "bool": bool, "abs": abs,
-        "round": round, "sum": sum, "min": min, "max": max,
-        "sorted": sorted, "any": any, "all": all, "enumerate": enumerate,
-        "zip": zip, "open": sandbox_open if use_restricted_open else open,
-        "eval": safe_eval, "exec": safe_exec, "globals": globals,
-        "locals": locals, "hasattr": hasattr, "getattr": getattr,
-        "setattr": setattr, "isinstance": isinstance, "callable": callable,
-        "type": type, "issubclass": issubclass, "dir": dir, "vars": vars,
-        "next": next, "iter": iter, "__import__": safe_import,
+        # ---- 基础类型 ----
+        "print": print, "len": len, "range": range,
+        "list": list, "dict": dict, "tuple": tuple, "set": set,
+        "frozenset": frozenset, "str": str, "bytes": bytes,
+        "bytearray": bytearray, "int": int, "float": float,
+        "complex": complex, "bool": bool, "object": object,
+
+        # ---- 数学 / 迭代 ----
+        "abs": abs, "round": round, "sum": sum, "min": min, "max": max,
+        "sorted": sorted, "any": any, "all": all,
+        "enumerate": enumerate, "zip": zip, "map": map, "filter": filter,
+        "reversed": reversed, "iter": iter, "next": next,
+        "range": range, "slice": slice, "pow": pow, "divmod": divmod,
+
+        # ---- 类型 / 反射 ----
+        "type": type, "isinstance": isinstance, "issubclass": issubclass,
+        "callable": callable, "hasattr": hasattr, "getattr": getattr,
+        "setattr": setattr, "delattr": delattr, "dir": dir, "vars": vars,
+        "id": id, "hash": hash, "repr": repr, "format": format,
+        "chr": chr, "ord": ord, "bin": bin, "hex": hex, "oct": oct,
+
+        # ---- 类定义支持（关键修复）----
+        "__build_class__": _builtins.__build_class__,
+        "super": super, "property": property,
+        "staticmethod": staticmethod, "classmethod": classmethod,
+        "__name__": "__sandbox__",   # 类体里 __name__ 查得到的兜底
+
+        # ---- 文件 / IO ----
+        "open": sandbox_open if use_restricted_open else open,
+
+        # ---- 沙盒封装 ----
+        "eval": safe_eval, "exec": safe_exec,
+        "globals": _builtins.globals,
+        "locals": _builtins.locals,
+        "__import__": safe_import,
     }
 
     # 清理系统模块中的危险函数
@@ -2449,22 +2670,24 @@ class RemoteFS:
             print(local)
             print("远程内容：")
             print(remote)
-            choice = (
-                input("选择 (l)本地覆盖, (r)远程覆盖, (m)手动合并 (输入 l/r/m): ").strip().lower()
+            choice = self._ask_user(
+                "冲突处理",
+                "选择 l=本地覆盖, r=远程覆盖, m=手动合并:",
+                mode="choice",
             )
+            if choice is None:
+                return None
+            choice = choice.strip().lower()
             if choice == "l":
                 return local
             elif choice == "r":
                 return remote
             elif choice == "m":
-                print("请输入合并后的内容，以 . 结束：")
-                lines = []
-                while True:
-                    line = input()
-                    if line == ".":
-                        break
-                    lines.append(line)
-                return "\n".join(lines)
+                return self._ask_user(
+                    "手动合并",
+                    "请输入合并后的内容：",
+                    mode="string",
+                )
             else:
                 return None
 
@@ -2776,17 +2999,27 @@ class VoiceAssistant:
         self.shell = shell
         self.recognizer = None
         self.microphone = None
+        self.available = False
         if HAS_SPEECH:
             try:
+                # 先看系统里有没有麦克风
+                mics = sr.Microphone.list_microphone_names()
+                if not mics:
+                    print("⚠️ 系统未检测到麦克风，语音助手不可用")
+                    return
                 self.recognizer = sr.Recognizer()
                 self.microphone = sr.Microphone()
+                self.available = True
+                print(f"✅ 语音助手就绪（找到 {len(mics)} 个麦克风）")
             except Exception as e:
-                print(f"警告：语音识别初始化失败（可能缺少 PyAudio）: {e}")
+                print(f"警告：语音识别初始化失败: {e}")
                 self.recognizer = None
                 self.microphone = None
 
     def listen(self):
         if not HAS_SPEECH or self.microphone is None:
+            return None
+        if not getattr(self, "available", False):
             return None
         with self.microphone as source:
             print("请说话...")
@@ -2794,16 +3027,18 @@ class VoiceAssistant:
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
                 audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=5)
                 text = self.recognizer.recognize_google(audio, language="zh-CN")
-                print(f"识别: {text}")
+                print(f"✅ 识别成功: {text}")
                 return text
             except sr.WaitTimeoutError:
-                print("等待超时，未检测到语音")
+                print("⏱️ 等待超时：5 秒内没有检测到语音")
             except sr.UnknownValueError:
-                print("无法识别语音")
+                print("❓ 无法识别：音频不清楚，Google 引擎没听懂")
+            except sr.RequestError as e:
+                print(f"🌐 网络错误：Google 语音服务请求失败 ({e})")
+                print("   → 会弹出输入框让你手动打字")
             except Exception as e:
-                print(f"语音识别失败: {e}")
+                print(f"❌ 语音识别失败: {e}")
             return None
-
     def execute(self, text):
         if not text:
             # 如果语音识别失败，弹出输入框让用户打字
@@ -2870,7 +3105,8 @@ class Config:
         "ai": {
             "provider": "mock",
             "api_key": "",
-            "model": "gpt-3.5-turbo",
+            "model": "auto",
+            "online_enabled": None,
             "base_url": "https://api.openai.com/v1/chat/completions",
             "system_prompt": "You are a helpful assistant.",
         },
@@ -5344,11 +5580,10 @@ class SyscallHandler:
 
     # ===== 系统信息 =====
     def _sys_uname(self) -> dict:
-        """获取系统信息"""
         return {
             "sysname": "KIKI OS",
             "nodename": self.shell.hostname if self.shell else "kiki-os",
-            "release": "7.0",
+            "release": KIKI_VERSION,
             "version": "2024",
             "machine": "x86_64",
         }
@@ -6360,13 +6595,21 @@ document.getElementById('syncBtn').addEventListener('click', async function() {
 class OutputRedirector:
     def __init__(self, q):
         self.q = q
+        self._buffer = ""
 
     def write(self, txt):
-        if txt:
-            self.q.put(txt)
+        if not txt:
+            return
+        self._buffer += txt
+        # 按行拆分，完整一行才入队
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self.q.put(line + "\n")
 
     def flush(self):
-        pass
+        if self._buffer:
+            self.q.put(self._buffer)
+            self._buffer = ""
 
 
 class KikiWindow(ctk.CTkToplevel):
@@ -7067,6 +7310,326 @@ class KikiTabWindow(KikiWindow):
                 self.current_tab = None
 
 
+class NotificationCenterWindow(KikiWindow):
+    """通知大厅：查看历史通知。"""
+
+    def __init__(self, master, gui_app):
+        super().__init__(master, title="🔔 通知大厅", width=600, height=500)
+        self.gui = gui_app
+
+        # 顶部工具栏
+        toolbar = ctk.CTkFrame(self.content_frame, fg_color="transparent")
+        toolbar.pack(fill="x", padx=10, pady=(10, 5))
+
+        self.count_label = ctk.CTkLabel(toolbar, text="", font=("Arial", 11))
+        self.count_label.pack(side="left", padx=5)
+
+        ctk.CTkButton(
+            toolbar, text="🗑️ 清空历史", width=100,
+            command=self._clear_all, fg_color="#f44336"
+        ).pack(side="right", padx=5)
+        ctk.CTkButton(
+            toolbar, text="🔄 刷新", width=80,
+            command=self._refresh
+        ).pack(side="right", padx=5)
+
+        # 列表区
+        self.list_frame = ctk.CTkScrollableFrame(
+            self.content_frame, fg_color="#2a2a2a", corner_radius=8
+        )
+        self.list_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self._refresh()
+
+    def _refresh(self):
+        # 清空现有项
+        for w in self.list_frame.winfo_children():
+            w.destroy()
+
+        history = getattr(self.gui, "_notification_history", [])
+        self.count_label.configure(text=f"共 {len(history)} 条通知")
+
+        if not history:
+            ctk.CTkLabel(
+                self.list_frame, text="（暂无通知）",
+                text_color="#888", font=("Arial", 12)
+            ).pack(pady=20)
+            return
+
+        # 从新到旧显示
+        for entry in reversed(history):
+            self._add_item(entry)
+
+    def _add_item(self, entry):
+        frame = ctk.CTkFrame(self.list_frame, fg_color="#1e1e1e", corner_radius=6)
+        frame.pack(fill="x", padx=5, pady=3)
+
+        # 左侧：图标 + 时间
+        left = ctk.CTkFrame(frame, fg_color="transparent", width=110)
+        left.pack(side="left", fill="y", padx=(8, 4), pady=6)
+        left.pack_propagate(False)
+
+        icon_map = {
+            "info": "ℹ️", "warning": "⚠️",
+            "error": "❌", "success": "✅",
+        }
+        icon = icon_map.get(entry.get("level", "info"), "ℹ️")
+
+        ctk.CTkLabel(
+            left, text=icon, font=("Segoe UI Emoji", 18)
+        ).pack(anchor="w")
+
+        ctk.CTkLabel(
+            left, text=entry.get("time", "")[-8:],
+            text_color="#888", font=("Arial", 9)
+        ).pack(anchor="w")
+
+        # 右侧：标题 + 内容
+        right = ctk.CTkFrame(frame, fg_color="transparent")
+        right.pack(side="left", fill="both", expand=True, padx=4, pady=6)
+
+        ctk.CTkLabel(
+            right, text=entry.get("title", ""),
+            anchor="w", font=("Arial", 11, "bold")
+        ).pack(anchor="w")
+
+        msg_label = ctk.CTkLabel(
+            right, text=entry.get("message", ""),
+            anchor="w", font=("Arial", 10),
+            text_color="#ccc", wraplength=420, justify="left"
+        )
+        msg_label.pack(anchor="w", pady=(2, 0))
+
+    def _clear_all(self):
+        if messagebox.askyesno("清空历史", "确定要清空所有通知历史吗？"):
+            self.gui._notification_history = []
+            self._refresh()
+
+
+class UserManagerWindow(KikiWindow):
+    """用户管理：新增 / 删除 / 改密 / 切换 / 注销"""
+
+    def __init__(self, master, shell):
+        super().__init__(master, title="👥 用户管理", width=700, height=500)
+        self.shell = shell
+        self.gui = master
+
+        # 顶部工具栏
+        toolbar = ctk.CTkFrame(self.content_frame, fg_color="transparent")
+        toolbar.pack(fill="x", padx=10, pady=(10, 5))
+
+        ctk.CTkButton(toolbar, text="➕ 新增用户", command=self._add_user,
+                      fg_color="#4CAF50", width=110).pack(side="left", padx=4)
+        ctk.CTkButton(toolbar, text="✏️ 修改密码", command=self._change_password,
+                      width=110).pack(side="left", padx=4)
+        ctk.CTkButton(toolbar, text="🗑️ 删除用户", command=self._delete_user,
+                      fg_color="#f44336", width=110).pack(side="left", padx=4)
+        ctk.CTkButton(toolbar, text="🔄 切换用户", command=self._switch_user,
+                      width=110).pack(side="left", padx=4)
+        ctk.CTkButton(toolbar, text="🚪 注销", command=self._logout,
+                      width=80).pack(side="right", padx=4)
+
+        # 用户列表
+        list_frame = ctk.CTkFrame(self.content_frame, fg_color="#2a2a2a", corner_radius=8)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.user_listbox = tk.Listbox(
+            list_frame,
+            bg="#2a2a2a", fg="white",
+            selectbackground="#4a9eff",
+            font=("Consolas", 12),
+            height=15,
+        )
+        self.user_listbox.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # 底部状态
+        self.status_label = ctk.CTkLabel(self.content_frame, text="", font=("Arial", 11))
+        self.status_label.pack(pady=(0, 10))
+
+        self._refresh()
+
+    def _refresh(self):
+        self.user_listbox.delete(0, "end")
+        users = sorted(self.shell.users.keys())
+        current = self.shell.username
+        for u in users:
+            tags = []
+            if u == current:
+                tags.append("当前登录")
+            if u in self.shell.admin_users:
+                tags.append("管理员")
+            suffix = f"  [{', '.join(tags)}]" if tags else ""
+            self.user_listbox.insert("end", f"👤 {u}{suffix}")
+        self.status_label.configure(text=f"共 {len(users)} 个用户")
+
+    def _selected_user(self):
+        sel = self.user_listbox.curselection()
+        if not sel:
+            return None
+        line = self.user_listbox.get(sel[0])
+        # 从 "👤 username  [...]" 解析出 username
+        return line.replace("👤 ", "").split("  [")[0].strip()
+
+    # -------- 新增用户 --------
+    def _add_user(self):
+        dlg = ctk.CTkInputDialog(text="输入新用户名:", title="新增用户")
+        username = dlg.get_input()
+        if not username:
+            return
+        username = username.strip().lower()
+        if username in self.shell.RESERVED_USERNAMES:
+            messagebox.showerror("错误", f"'{username}' 是保留用户名")
+            return
+        with self.shell._lock:
+            if username in self.shell.users:
+                messagebox.showerror("错误", f"用户 '{username}' 已存在")
+                return
+        dlg2 = ctk.CTkInputDialog(text=f"为 {username} 设置密码（至少6位）:", title="密码")
+        pwd1 = dlg2.get_input()
+        if not pwd1 or len(pwd1) < 6:
+            messagebox.showerror("错误", "密码不能少于 6 位")
+            return
+        dlg3 = ctk.CTkInputDialog(text="再次输入密码:", title="确认密码")
+        pwd2 = dlg3.get_input()
+        if pwd1 != pwd2:
+            messagebox.showerror("错误", "两次密码不一致")
+            return
+        with self.shell._lock:
+            self.shell.users[username] = hash_password(pwd1)
+        self.shell._save_users()
+        self.shell.ensure_home(username)
+        self.shell.fs._audit(f"ADDUSER {username}", self.shell.username)
+        self._refresh()
+        self.gui._show_notification(f"✅ 用户 {username} 已创建")
+
+    # -------- 修改密码 --------
+    def _change_password(self):
+        target = self._selected_user()
+        if not target:
+            messagebox.showinfo("提示", "请先在列表中选择一个用户")
+            return
+        # 只能改自己的，或者 admin 改别人的
+        if target != self.shell.username and not self.shell._is_admin():
+            messagebox.showerror("错误", "只有管理员可以修改其他用户的密码")
+            return
+        if target == self.shell.username:
+            old = ctk.CTkInputDialog(text="当前密码:", title="验证").get_input()
+            with self.shell._lock:
+                if not old or not verify_password(self.shell.users[target], old):
+                    messagebox.showerror("错误", "当前密码不正确")
+                    return
+        new1 = ctk.CTkInputDialog(text="新密码（至少6位）:", title="新密码").get_input()
+        if not new1 or len(new1) < 6:
+            messagebox.showerror("错误", "密码不能少于 6 位")
+            return
+        new2 = ctk.CTkInputDialog(text="确认新密码:", title="确认").get_input()
+        if new1 != new2:
+            messagebox.showerror("错误", "两次密码不一致")
+            return
+        with self.shell._lock:
+            self.shell.users[target] = hash_password(new1)
+        self.shell._save_users()
+        self.shell.fs._audit(f"PASSWD {target}", self.shell.username)
+        messagebox.showinfo("成功", f"用户 {target} 的密码已修改")
+
+    # -------- 删除用户 --------
+    def _delete_user(self):
+        target = self._selected_user()
+        if not target:
+            messagebox.showinfo("提示", "请先在列表中选择一个用户")
+            return
+        if not self.shell._is_admin():
+            messagebox.showerror("错误", "只有管理员可以删除用户")
+            return
+        if target == "root":
+            messagebox.showerror("错误", "不能删除 root")
+            return
+        if target == self.shell.username:
+            messagebox.showerror("错误", "不能删除当前登录的用户")
+            return
+        if not messagebox.askyesno("确认删除", f"确定要删除用户 '{target}' 及其所有数据吗？"):
+            return
+        with self.shell._lock:
+            if target in self.shell.users:
+                del self.shell.users[target]
+        home = f"/home/{target}"
+        if self.shell.fs.resolve(home, "root"):
+            self.shell.fs.delete(home, "root", permanent=True)
+        self.shell._save_users()
+        self.shell.fs._audit(f"DELUSER {target}", self.shell.username)
+        self._refresh()
+        self.gui._show_notification(f"✅ 用户 {target} 已删除")
+
+    # -------- 切换用户 --------
+    def _switch_user(self):
+        target = self._selected_user()
+        if not target:
+            messagebox.showinfo("提示", "请先在列表中选择一个用户")
+            return
+        if target == self.shell.username:
+            messagebox.showinfo("提示", "已经是当前用户")
+            return
+        pwd = ctk.CTkInputDialog(text=f"输入 {target} 的密码:", title="切换用户").get_input()
+        if not pwd:
+            return
+        with self.shell._lock:
+            if not verify_password(self.shell.users[target], pwd):
+                messagebox.showerror("错误", "密码不正确")
+                return
+        # 复用 shell 的 su 逻辑
+        self.shell.username = target
+        home = self.shell.ensure_home(target)
+        self.shell.fs._node_cache.clear()
+        self.shell.fs._perm_cache.clear()
+        self.shell.fs.cwd = self.shell.fs.resolve(home, target)
+        self.shell.config.load_user_config(target)
+        self.shell.apply_config()
+        self.shell._load_user_env()
+
+        # ★ 更新 GUI 的用户名（先改，后刷新）
+        self.gui.username = target
+        self.gui._update_status()
+
+        # ★ 重新加载该用户的固定项 / 挂件
+        try:
+            self.gui._load_pinned_items()
+        except Exception:
+            pass
+        try:
+            if hasattr(self.gui, "_load_widgets"):
+                self.gui._load_widgets()
+        except Exception:
+            pass
+
+        # ★ 刷新文件管理器（如果开着）
+        self.gui._refresh_all_file_managers(f"/home/{target}")
+
+        # ★ 更新壁纸（不同用户壁纸可能不同）
+        try:
+            self.gui._update_wallpaper()
+        except Exception:
+            pass
+
+        # ★ 重建桌面图标（放最后，确保其它状态都已更新）
+        self.gui._create_desktop_icons()
+
+        # ★ 更新 Dock 栏
+        try:
+            self.gui._update_dock()
+        except Exception:
+            pass
+
+        self.shell.fs._audit(f"SU {target}", self.shell.username)
+        self._refresh()
+        self.gui._show_notification(f"✅ 已切换到 {target}")
+
+    # -------- 注销 --------
+    def _logout(self):
+        if messagebox.askyesno("注销", f"确定注销 {self.shell.username} 并回到登录界面吗？"):
+            self.destroy()
+            self.gui._logout()
+
+
 class DesktopWidget(ctk.CTkToplevel):
     """桌面小工具基类"""
 
@@ -7507,12 +8070,28 @@ class QtTabBrowserWindow(KikiWindow):
         shell=None,
         username=None,
     ):
+        # ★★★ 能力检查必须在最前面，不满足立即抛出，绝不进入窗口创建 ★★★
         if QT_LIB is None:
-            raise ImportError("PyQt5/PySide6 未安装")
+            raise ImportError(
+                "PyQt5/PySide6 未安装。\n"
+                "PyQt5: pip install PyQt5 PyQtWebEngine\n"
+                "PySide6: pip install PySide6 PySide6-Addons"
+            )
+        if not HAS_QTWEBENGINE:
+            raise ImportError(
+                f"已安装 {QT_LIB}，但缺少 QtWebEngine 组件。\n"
+                f"PyQt5: pip install PyQtWebEngine\n"
+                f"PySide6: pip install PySide6-Addons"
+            )
+        if not HAS_QTWEBENGINE_ADDONS:
+            raise ImportError(
+                f"{QT_LIB} 的 QtWebEngine 附加组件缺失。\n"
+                f"PyQt5: pip install PyQtWebEngine\n"
+                f"PySide6: pip install PySide6-Addons"
+            )
 
-        # 强制软件渲染（必须在 QApplication 实例化之前设置）
+        # ★★★ 检查通过，才设置环境变量、调用 super ★★★
         import os
-
         os.environ["QT_OPENGL"] = "software"
         os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
             "--disable-gpu --disable-software-rasterizer --disable-webgl --use-angle=d3d11"
@@ -7520,6 +8099,7 @@ class QtTabBrowserWindow(KikiWindow):
         os.environ["QT_QUICK_BACKEND"] = "software"
 
         super().__init__(master, title="浏览器", width=900, height=650)
+
         self.url = url
         self.gui = master
         self.shell = shell
@@ -7534,8 +8114,8 @@ class QtTabBrowserWindow(KikiWindow):
         self.placeholder = ctk.CTkFrame(self.content_frame, fg_color="white")
         self.placeholder.pack(fill="both", expand=True)
 
-        # 延迟初始化 Qt，如果失败则抛出异常
-        self._init_qt_sync()  # 改用同步初始化，以便捕获异常
+        # 延迟初始化 Qt（同步）
+        self._init_qt_sync()
 
         # 绑定事件
         self.bind("<Configure>", self._schedule_resize)
@@ -8529,48 +9109,92 @@ class Notification(ctk.CTkToplevel):
         self.overrideredirect(True)
         self.attributes("-topmost", True)
         self.configure(fg_color="#2b2b2b")
-        self.geometry("320x70")
+
+        # ============ 根据内容动态计算尺寸 ============
+        # 固定宽度，高度自适应
+        WIDTH = 360
+        PADDING_X = 12
+        PADDING_Y = 12
+
+        # 用临时 Label 测量标题和内容占几行
+        import tkinter.font as tkfont
+        try:
+            title_font = tkfont.Font(family="Arial", size=12, weight="bold")
+            msg_font = tkfont.Font(family="Arial", size=11)
+        except Exception:
+            title_font = None
+            msg_font = None
+
+        # 内容可用宽度 = 总宽 - 左右 padding - 图标区 - 关闭按钮区
+        avail_w = WIDTH - PADDING_X * 2 - 40 - 30
+
+        title_lines = 1
+        msg_lines = 1
+        if msg_font:
+            try:
+                title_lines = max(1, self._count_lines(title, title_font, avail_w))
+                msg_lines = max(1, self._count_lines(message, msg_font, avail_w))
+            except Exception:
+                pass
+        else:
+            # 简单估算：中文按 15px/字，英文按 7px/字
+            title_lines = max(1, len(title) * 14 // avail_w + 1)
+            msg_lines = max(1, len(message) * 14 // avail_w + 1)
+
+        line_h = 22
+        title_h = title_lines * line_h
+        msg_h = msg_lines * line_h
+
+        # 总高度 = 上下 padding + 标题 + 内容 + 间距
+        HEIGHT = PADDING_Y * 2 + title_h + 6 + msg_h
+        HEIGHT = max(70, min(HEIGHT, 300))  # 限制在 70~300
+
+        self.geometry(f"{WIDTH}x{HEIGHT}")
+
+        # ============ 布局 ============
         main_frame = ctk.CTkFrame(self, fg_color="#2b2b2b", corner_radius=8)
         main_frame.pack(fill="both", expand=True, padx=2, pady=2)
+
+        # 左侧图标（垂直居中）
         icon_label = ctk.CTkLabel(
-            main_frame, text=icon, font=("Segoe UI Emoji", 24), text_color="white"
+            main_frame, text=icon,
+            font=("Segoe UI Emoji", 22), text_color="white",
         )
-        icon_label.pack(side="left", padx=(10, 5), pady=10)
+        icon_label.pack(side="left", padx=(PADDING_X, 4))
+
+        # 右侧文字区
         text_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        text_frame.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+        text_frame.pack(side="left", fill="both", expand=True, padx=(4, 4), pady=PADDING_Y)
+
         title_label = ctk.CTkLabel(
-            text_frame,
-            text=title,
-            font=("Arial", 12, "bold"),
-            text_color="white",
-            anchor="w",
+            text_frame, text=title,
+            font=("Arial", 12, "bold"), text_color="white",
+            anchor="w", justify="left", wraplength=avail_w,
         )
-        title_label.pack(anchor="w")
+        title_label.pack(anchor="w", fill="x")
+
         msg_label = ctk.CTkLabel(
-            text_frame,
-            text=message,
-            font=("Arial", 11),
-            text_color="#d0d0d0",
-            anchor="w",
-            justify="left",
+            text_frame, text=message,
+            font=("Arial", 11), text_color="#d0d0d0",
+            anchor="w", justify="left", wraplength=avail_w,
         )
-        msg_label.pack(anchor="w")
+        msg_label.pack(anchor="w", fill="x", pady=(4, 0))
+
+        # 关闭按钮（右上角，绝对定位）
         close_btn = ctk.CTkButton(
-            main_frame,
-            text="✕",
-            width=24,
-            height=24,
-            fg_color="transparent",
-            text_color="#888",
-            hover_color="#cc0000",
+            main_frame, text="✕", width=22, height=22,
+            fg_color="transparent", text_color="#888",
+            hover_color="#cc0000", font=("Arial", 10),
             command=self.destroy,
         )
-        close_btn.pack(side="right", padx=5, pady=5)
-        self._position()
+        close_btn.place(relx=1.0, rely=0.0, anchor="ne", x=-4, y=4)
+
+        self._position(width=WIDTH, height=HEIGHT)
         self.attributes("-alpha", 0.0)
         self.after(50, self._fade_in)
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
+
         with Notification._lock:
             if Notification._current is None:
                 Notification._current = self
@@ -8579,12 +9203,52 @@ class Notification(ctk.CTkToplevel):
                 Notification._queue.append(self)
                 self.withdraw()
 
-    def _position(self):
-        sw = self.gui.winfo_screenwidth()
-        sh = self.gui.winfo_screenheight()
-        x = sw - 340
-        y = sh - 90
-        self.geometry(f"+{x}+{y}")
+    # ---------- 辅助：计算文字占几行 ----------
+    @staticmethod
+    def _count_lines(text, font, max_width):
+        """粗略估算 text 在给定字体下占几行。"""
+        if not text:
+            return 1
+        # 按段落分割，每段内按词/字累加宽度
+        total_lines = 0
+        for paragraph in str(text).split("\n"):
+            if not paragraph:
+                total_lines += 1
+                continue
+            line_width = 0
+            lines = 1
+            # 逐字符累加（中英文都能处理，简单可靠）
+            for ch in paragraph:
+                try:
+                    ch_w = font.measure(ch)
+                except Exception:
+                    ch_w = 14
+                if line_width + ch_w > max_width:
+                    lines += 1
+                    line_width = ch_w
+                else:
+                    line_width += ch_w
+            total_lines += lines
+        return total_lines
+
+    def _position(self, width=None, height=None):
+        """将通知定位在屏幕右下角。width/height 为 None 时用当前窗口实际尺寸。"""
+        try:
+            if width is None:
+                width = self.winfo_reqwidth()
+            if height is None:
+                height = self.winfo_reqheight()
+
+            sw = self.gui.winfo_screenwidth()
+            sh = self.gui.winfo_screenheight()
+
+            # 右下角，留 20px 边距
+            x = sw - width - 20
+            y = sh - height - 60  # 底部让出 Dock 栏空间
+
+            self.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            pass
 
     def _fade_in(self):
         self.alpha += 0.1
@@ -8964,7 +9628,7 @@ class Pet:
                 duration_ms, lambda: self._set_emoji(self.default_emoji)
             )
 
-    def show_bubble(self, text):
+    def show_bubble(self, text, duration=2000):
         if not self._running:
             return
         bubble = tk.Toplevel(self.window)
@@ -8985,7 +9649,7 @@ class Pet:
             pady=2,
         )
         label.pack()
-        self.gui.after(2000, bubble.destroy)
+        self.gui.after(duration, bubble.destroy)
 
     def show_context_menu(self, event):
         menu = tk.Menu(self.window, tearoff=0)
@@ -9025,25 +9689,79 @@ class Pet:
         if not shell.voice:
             self.show_bubble("语音助手未初始化")
             return
-
-        self.last_interact = time.time()
-        self.show_bubble("🎤 请说话...")
-
-        text = shell.voice.listen()
-        if not text:
-            from tkinter import simpledialog
-            text = simpledialog.askstring("语音识别失败", "请手动输入指令:", parent=self.master)
-        if not text:
-            self.show_bubble("未输入指令")
+        if not getattr(shell.voice, "available", False):
+            self.show_bubble("未检测到麦克风")
             return
 
-        self.show_bubble(f"👤 {text}")
+        self.last_interact = time.time()
+        self.show_bubble("🎤 正在聆听，请说话...", duration=10000)
+
+        import threading
+
+        def work():
+            # ★ 第一步：AI 模型选择（会弹窗，走主线程调度）
+            if (hasattr(shell, "ai_engine") and shell.ai_engine
+                    and shell.ai_engine._model_user_choice is None):
+                def _ask_model():
+                    try:
+                        shell.ai_engine._try_enable_model_sync()
+                    except Exception as e:
+                        print(f"[语音] 启用在线模型失败: {e}")
+                shell._run_in_main_thread(_ask_model, timeout=120)
+
+            # ★ 第二步：录音
+            try:
+                text = shell.voice.listen()
+            except Exception as e:
+                print(f"[语音] listen 异常: {e}")
+                text = None
+
+            # ★ 第三步：交给主线程处理结果
+            try:
+                if self.gui and self.gui.winfo_exists():
+                    self.gui.after(0, lambda t=text: self._on_voice_result(t, shell))
+            except Exception as e:
+                print(f"[语音] 调度回调失败: {e}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_voice_result(self, text, shell):
+        """listen() 结果回到主线程处理。"""
+        # 识别失败 → 弹窗手动输入（一定要把主窗口拉到最前，否则会被宠物置顶窗口挡住）
+        if not text:
+            from tkinter import simpledialog
+            try:
+                self.gui.lift()
+                self.gui.focus_force()
+            except Exception:
+                pass
+            try:
+                text = simpledialog.askstring(
+                    "语音识别失败",
+                    "未识别到有效语音（可能网络异常或麦克风问题）。\n"
+                    "请手动输入您的指令：",
+                    parent=self.gui,
+                )
+            except Exception as e:
+                print(f"[语音] 手动输入弹窗失败: {e}")
+                text = None
+
+        if not text:
+            self.show_bubble("已取消", duration=2000)
+            return
+
+        self.show_bubble(f"👤 你说: {text}", duration=3000)
 
         def on_reply(reply, emoji="🤖"):
-            short = reply if len(reply) <= 80 else reply[:80] + "…"
-            self.show_bubble(f"{emoji} {short}")
+            if not reply:
+                reply = "（AI 没有给出回复）"
+            short = reply if len(reply) <= 100 else reply[:100] + "…"
+            self.show_bubble(f"{emoji} {short}", duration=6000)
 
-        shell.ai_engine.ask_voice(text, on_reply)
+        try:
+            shell.ai_engine.ask_voice(text, on_reply)
+        except Exception as e:
+            self.show_bubble(f"❌ AI 处理失败: {e}", duration=5000)
 
     def react_to_event(self, event_type):
         if not self._running:
@@ -10117,7 +10835,7 @@ class FileManager(ctk.CTkFrame):
         self._search_stop = True
         self.cancel_load_btn.configure(text="✅", fg_color="#00aa00", state="disabled")
         if hasattr(self.master, "_show_notification"):
-            self.gui._show_notification("已取消文件加载/搜索")
+            self.gui._show_notification("已取消加载/搜索")
 
     # ========== 辅助方法（原有） ==========
     def _on_recursive_toggle(self):
@@ -10236,28 +10954,29 @@ class FileManager(ctk.CTkFrame):
         import os
         import threading
 
-        # 清空当前树视图
         self.tree.delete(*self.tree.get_children())
-        self._search_stop = False
-        self._search_filter_text = keyword
-        self._search_results = []
+        self._search_paths = {}
 
         if not keyword:
-            # 无关键词则重新加载当前目录
             self._load_host(self.host_cwd)
             return
 
         search_root = self.host_cwd
+        recursive = self.recursive_var.get()
+
+        # 清空并准备
+        self._search_results_cache = []
+
+        self._search_stop = False
         self.cancel_load_btn.configure(text="⏹", fg_color="#cc0000", state="normal")
 
         def do_search():
-            """后台执行搜索"""
-            visited = set()  # 防止符号链接循环
+            visited = set()
 
             def collect(dir_path, depth=0):
                 if self._search_stop:
                     return
-                if depth > 6:  # 防止无限递归
+                if depth > 6:
                     return
                 try:
                     real = os.path.realpath(dir_path)
@@ -10269,36 +10988,43 @@ class FileManager(ctk.CTkFrame):
 
                 try:
                     items = os.listdir(dir_path)
-                except PermissionError:
-                    return
-                except Exception:
+                except (PermissionError, OSError):
                     return
 
                 for item in sorted(items):
                     if self._search_stop:
                         return
                     full_path = os.path.join(dir_path, item)
-                    # 匹配文件名
                     if keyword.lower() in item.lower():
-                        self._search_results.append((full_path, item, os.path.isdir(full_path)))
-                    # 递归：跳过符号链接
-                    if os.path.isdir(full_path) and not os.path.islink(full_path):
-                        collect(full_path, depth + 1)
+                        try:
+                            is_dir = os.path.isdir(full_path)
+                        except OSError:
+                            is_dir = False
+                        self._search_results_cache.append((full_path, item, is_dir))
+                    try:
+                        if os.path.isdir(full_path) and not os.path.islink(full_path):
+                            collect(full_path, depth + 1)
+                    except OSError:
+                        pass
 
-            if self.recursive_var.get():
+            if recursive:
                 collect(search_root)
             else:
                 try:
                     items = os.listdir(search_root)
-                    for item in sorted(items):
-                        if keyword.lower() in item.lower():
-                            full = os.path.join(search_root, item)
-                            self._search_results.append((full, item, os.path.isdir(full)))
-                except Exception:
-                    pass
+                except (PermissionError, OSError):
+                    items = []
+                for item in sorted(items):
+                    if keyword.lower() in item.lower():
+                        full = os.path.join(search_root, item)
+                        try:
+                            is_dir = os.path.isdir(full)
+                        except OSError:
+                            is_dir = False
+                        self._search_results_cache.append((full, item, is_dir))
 
-            # 搜索完成，通过after回调更新UI
-            if not self._search_stop:
+            # 回到主线程更新 UI
+            if self.winfo_exists():
                 self.after(0, self._display_host_search_results)
 
         self._search_thread = threading.Thread(target=do_search, daemon=True)
@@ -10306,11 +11032,14 @@ class FileManager(ctk.CTkFrame):
 
     def _display_host_search_results(self):
         """在主线程中显示搜索结果"""
-        if self._search_stop:
+        if not self.winfo_exists():
+            return
+        if getattr(self, "_search_stop", False):
             self.cancel_load_btn.configure(text="✅", fg_color="#00aa00", state="disabled")
             return
+
         self.tree.delete(*self.tree.get_children())
-        for full, name, is_dir in self._search_results:
+        for full, name, is_dir in self._search_results_cache:
             icon = self._get_icon(name, is_dir)
             typ = "目录" if is_dir else self._get_type_name(name, False)
             if is_dir:
@@ -10320,18 +11049,23 @@ class FileManager(ctk.CTkFrame):
                     size = str(os.path.getsize(full))
                 except OSError:
                     size = "0"
-            self.tree.insert("", "end", text=name, values=(size, typ), image=icon)
-        self.cancel_load_btn.configure(text="✅", fg_color="#00aa00", state="disabled")
+            display_name = name
+            counter = 1
+            while display_name in self._search_paths:
+                counter += 1
+                display_name = f"{name} ({counter})"
+            self._search_paths[display_name] = (full, is_dir)
+            self.tree.insert("", "end", text=display_name, values=(size, typ), image=icon)
+
         self.pv.set(self.host_cwd)
-        # 如果结果为空，提示
-        if not self._search_results:
-            # 可以在状态栏或通知中显示无结果
-            pass
+        self.cancel_load_btn.configure(text="✅", fg_color="#00aa00", state="disabled")
 
     def _clear_search(self):
         self.search_var.set("")
         self.search_filter = None
+        self._search_paths = {}
         self._load()
+
 
     def _go(self):
         p = self.pv.get().strip()
@@ -10399,19 +11133,28 @@ class FileManager(ctk.CTkFrame):
 
         # ===== 宿主机模式 =====
         if self.mode == "host":
-            full = os.path.join(self.host_cwd, name)
-            if os.path.isdir(full):
+            # 优先使用搜索缓存里的真实路径
+            if hasattr(self, "_search_paths") and display_name in self._search_paths:
+                full, is_dir = self._search_paths[display_name]
+            elif name in self._search_paths:
+                full, is_dir = self._search_paths[name]
+            else:
+                full = os.path.join(self.host_cwd, name)
+                is_dir = os.path.isdir(full)
+            if not os.path.exists(full):
+                messagebox.showerror("错误", f"文件或目录不存在: {full}")
+                return
+            if is_dir:
                 self._load_host(full)
             else:
                 self._open_host_file(full)
             return
 
         # ===== VFS 模式 =====
-        # ===== 优先使用递归搜索路径 =====
+        # 优先使用递归搜索路径
         if hasattr(self, "_search_paths") and name in self._search_paths:
             full, _is_dir = self._search_paths[name]
         else:
-            # 原有的路径拼接逻辑
             if name.startswith("/"):
                 full = name
             elif name.startswith(".."):
@@ -10426,13 +11169,8 @@ class FileManager(ctk.CTkFrame):
                         else:
                             parts.append(part)
                     full = "/".join(parts)
-            elif "/" in name:
-                full = self.path + "/" + name if self.path != "/" else "/" + name
             else:
                 full = self.path + "/" + name if self.path != "/" else "/" + name
-            # 如果没有递归路径，就自己判断是否是目录
-            node = self.shell.fs.resolve(full, self.username)
-            isinstance(node, Directory) if node else False
 
         if self._perm_cache.get(full, False):
             messagebox.showerror("权限错误", "您无权访问此文件或目录")
@@ -10441,6 +11179,7 @@ class FileManager(ctk.CTkFrame):
         if isinstance(node, Directory):
             self.search_var.set("")
             self.search_filter = None
+            self._search_paths = {}
             self._load(full)
         else:
             self._open_file(full, name)
@@ -10551,9 +11290,9 @@ class FileManager(ctk.CTkFrame):
                         if sys.platform.startswith("win"):
                             os.startfile(temp_path)
                         elif sys.platform.startswith("darwin"):
-                            subprocess.run(["open", temp_path])
+                            subprocess.Popen(["open", temp_path])
                         else:
-                            subprocess.run(["xdg-open", temp_path])
+                            subprocess.Popen(["xdg-open", temp_path])
                     except Exception as e2:
                         messagebox.showerror("错误", f"无法打开视频: {e2}")
                     return  # ✅
@@ -11126,26 +11865,42 @@ class FileManager(ctk.CTkFrame):
         item = sel[0]
         display_name = self.tree.item(item, "text")
         if display_name.startswith("🔒 "):
-            name = display_name[2:]
-        else:
-            name = display_name
+            display_name = display_name[2:]
+        name = display_name
 
+        # ===== 宿主机模式 =====
         if self.mode == "host":
-            full_path = os.path.join(self.host_cwd, name)
+            # 优先使用搜索缓存里的真实路径
+            if hasattr(self, "_search_paths") and display_name in self._search_paths:
+                full_path, is_dir = self._search_paths[display_name]
+            elif name in self._search_paths:
+                full_path, is_dir = self._search_paths[name]
+            else:
+                full_path = os.path.join(self.host_cwd, name)
+                is_dir = os.path.isdir(full_path)
             if not os.path.exists(full_path):
-                messagebox.showerror("错误", "文件或目录不存在")
+                messagebox.showerror("错误", f"文件或目录不存在: {full_path}")
                 return
-            self.clipboard = {
+            clipboard = {
                 "type": "host",
                 "path": full_path,
-                "name": name,
-                "is_dir": os.path.isdir(full_path),
+                "name": os.path.basename(full_path),
+                "is_dir": is_dir,
             }
+            # 文件：把内容读进剪贴板
+            if not is_dir:
+                try:
+                    with open(full_path, "rb") as f:
+                        clipboard["content"] = f.read()
+                except Exception as e:
+                    messagebox.showerror("错误", f"读取文件失败: {e}")
+                    return
+            self.clipboard = clipboard
             self.cut_mode = False
             self._show_notification(f"已复制: {name}")
             return
 
-        # VFS 模式
+        # ===== VFS 模式 =====
         full_path = self.path + "/" + name if self.path != "/" else "/" + name
         node = self.shell.fs.resolve(full_path, self.username)
         if node is None:
@@ -11156,34 +11911,16 @@ class FileManager(ctk.CTkFrame):
                 "type": "vfs",
                 "path": full_path,
                 "name": node.name,
-                "content": node.content,
+                "content": node.read(),
                 "mode": node.mode,
                 "is_dir": False,
             }
         elif isinstance(node, Directory):
-
-            def copy_dir_tree(n):
-                children = {}
-                for cname, child in n._children.items():
-                    if isinstance(child, File):
-                        children[cname] = {
-                            "type": "file",
-                            "content": child.content,
-                            "mode": child.mode,
-                        }
-                    elif isinstance(child, Directory):
-                        children[cname] = {
-                            "type": "dir",
-                            "children": copy_dir_tree(child),
-                            "mode": child.mode,
-                        }
-                return children
-
             self.clipboard = {
                 "type": "vfs",
                 "path": full_path,
                 "name": node.name,
-                "children": copy_dir_tree(node),
+                "tree": self._dir_to_dict(node),
                 "mode": node.mode,
                 "is_dir": True,
             }
@@ -11210,14 +11947,23 @@ class FileManager(ctk.CTkFrame):
             return
         item = sel[0]
         display_name = self.tree.item(item, "text")
-        display_name = display_name.removeprefix("🔒 ")
+        if display_name.startswith("🔒 "):
+            display_name = display_name[2:]
+        name = display_name
 
+        # ===== 宿主机模式 =====
         if self.mode == "host":
-            full = os.path.join(self.host_cwd, display_name)
+            # 优先使用搜索缓存里的真实路径
+            if hasattr(self, "_search_paths") and display_name in self._search_paths:
+                full, is_dir = self._search_paths[display_name]
+            elif name in self._search_paths:
+                full, is_dir = self._search_paths[name]
+            else:
+                full = os.path.join(self.host_cwd, name)
+                is_dir = os.path.isdir(full)
             if not os.path.exists(full):
-                messagebox.showerror("错误", "文件或目录不存在")
+                messagebox.showerror("错误", f"文件或目录不存在: {full}")
                 return
-            is_dir = os.path.isdir(full)
             if is_dir:
                 messagebox.showinfo("提示", "宿主机目录剪切暂不支持，请使用复制")
                 return
@@ -11230,41 +11976,44 @@ class FileManager(ctk.CTkFrame):
             self.clipboard = {
                 "type": "host",
                 "path": full,
-                "name": display_name,
+                "name": os.path.basename(full),
                 "is_dir": False,
                 "content": content,
             }
             try:
                 os.remove(full)
-                self._show_notification(f"已剪切: {display_name}")
+                self._show_notification(f"已剪切: {name}")
             except Exception as e:
                 messagebox.showerror("错误", f"剪切失败: {e}")
                 return
-        else:
-            # VFS 模式
-            full = self.path + "/" + display_name if self.path != "/" else "/" + display_name
-            node = self.shell.fs.resolve(full, self.username)
-            if node is None:
-                messagebox.showerror("错误", "文件或目录不存在")
-                return
-            is_dir = isinstance(node, Directory)
-            clipboard_data = {
-                "type": "vfs",
-                "path": full,
-                "name": display_name,
-                "is_dir": is_dir,
-            }
-            if is_dir:
-                clipboard_data["tree"] = self._dir_to_dict(node)
-            else:
-                clipboard_data["content"] = node.read()
-            self.clipboard = clipboard_data
-            if not self.shell.fs.delete(full, self.username, permanent=True):
-                messagebox.showerror("错误", "剪切失败，无法删除源文件")
-                return
-            self._show_notification(f"已剪切: {display_name}")
+            self.cut_mode = True
+            self._load_host(self.host_cwd)
+            return
 
+        # ===== VFS 模式 =====
+        full = self.path + "/" + name if self.path != "/" else "/" + name
+        node = self.shell.fs.resolve(full, self.username)
+        if node is None:
+            messagebox.showerror("错误", "文件或目录不存在")
+            return
+        is_dir = isinstance(node, Directory)
+        clipboard_data = {
+            "type": "vfs",
+            "path": full,
+            "name": node.name,
+            "is_dir": is_dir,
+            "mode": node.mode,
+        }
+        if is_dir:
+            clipboard_data["tree"] = self._dir_to_dict(node)
+        else:
+            clipboard_data["content"] = node.read()
+        self.clipboard = clipboard_data
+        if not self.shell.fs.delete(full, self.username, permanent=True):
+            messagebox.showerror("错误", "剪切失败，无法删除源文件")
+            return
         self.cut_mode = True
+        self._show_notification(f"已剪切: {name}")
         self._load()
 
     def _get_vfs_dst_path(self, name):
@@ -11399,7 +12148,6 @@ class FileManager(ctk.CTkFrame):
 
         # ===== Host 模式 =====
         elif self.mode == "host":
-            # 源是宿主机 → 复制到宿主机
             if src_type == "host":
                 dst_path = os.path.join(self.host_cwd, src_name)
                 if os.path.exists(dst_path):
@@ -11411,19 +12159,24 @@ class FileManager(ctk.CTkFrame):
                         messagebox.showerror("错误", "宿主目录已被剪切，无法复制目录（暂不支持）")
                         return
                     else:
-                        if content is None:
-                            messagebox.showerror("错误", "剪贴板中没有文件内容")
-                            return
+                        # 优先用剪贴板里的 content
+                        data = content
+                        if data is None:
+                            # 兜底：从源路径读取
+                            try:
+                                with open(src_path, "rb") as f:
+                                    data = f.read()
+                            except Exception as e:
+                                messagebox.showerror("错误", f"源文件读取失败: {e}")
+                                return
                         with open(dst_path, "wb") as f:
-                            f.write(content if isinstance(content, bytes) else content.encode("utf-8"))
+                            f.write(data if isinstance(data, bytes) else data.encode("utf-8"))
                     self._show_notification(f"已粘贴: {os.path.basename(dst_path)}")
                 except Exception as e:
                     messagebox.showerror("错误", f"粘贴失败: {e}")
-                # 不清空剪贴板
                 self._load_host(self.host_cwd)
                 return
 
-            # 源是 VFS → 复制到宿主机
             elif src_type == "vfs":
                 dst_path = os.path.join(self.host_cwd, src_name)
                 if os.path.exists(dst_path):
@@ -11437,15 +12190,21 @@ class FileManager(ctk.CTkFrame):
                             return
                         self._create_dir_from_tree_to_host(dst_path, tree)
                     else:
-                        if content is None:
-                            messagebox.showerror("错误", "剪贴板中没有文件内容")
-                            return
+                        data = content
+                        if data is None:
+                            # 兜底：从源路径读
+                            try:
+                                data = self.shell.fs.read_file(src_path, self.username)
+                            except Exception:
+                                data = None
+                            if data is None:
+                                messagebox.showerror("错误", "剪贴板中没有文件内容")
+                                return
                         with open(dst_path, "wb") as f:
-                            f.write(content if isinstance(content, bytes) else content.encode("utf-8"))
+                            f.write(data if isinstance(data, bytes) else data.encode("utf-8"))
                     self._show_notification(f"已粘贴: {os.path.basename(dst_path)}")
                 except Exception as e:
                     messagebox.showerror("错误", f"粘贴失败: {e}")
-                # 不清空剪贴板
                 self._load_host(self.host_cwd)
                 return
 
@@ -12123,8 +12882,10 @@ class WorkspaceManager(KikiWindow):
         }
         self.tabview.set(f"桌面 {desktop_id}")
 
-    def _on_tab_click(self, selected_tab_name):
+    def _on_tab_click(self, selected_tab_name=None):
         try:
+            if selected_tab_name is None:
+                selected_tab_name = self.tabview.get()
             desktop_id = int(selected_tab_name.split()[1])
             self.current_desktop = desktop_id
             self._render_preview(desktop_id)
@@ -12875,15 +13636,201 @@ class KIKI_API:
             self.gui.after(0, func)
 
     def kill_process(self, pid):
-        if not self._shell._is_admin():
+        if not self.shell._is_admin():
             return False
-        return self._shell.proc.kill(pid, self._shell.username)
+        return self.shell.proc.kill(pid, self.shell.username)
 
 
+class ModelRegistry:
+    """
+    自动检测本机 Ollama 上的可用模型，按能力分类，智能选择。
+    所有"用哪个模型"的决策都从这里走，不再硬编码。
+    """
+
+    # 视觉模型关键词（覆盖主流开源视觉模型）
+    VISION_KEYWORDS = [
+        "llava", "vision", "minicpm-v", "moondream", "bakllava",
+        "qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl",
+        "cogvlm", "llama3.2-vision", "gemma3", "pixtral",
+        "internvl", "phi-3-vision", "phi3-vision", "granite-vision",
+    ]
+
+    def __init__(self, shell=None):
+        self.shell = shell
+        self._cache = None
+        self._cache_time = 0
+        self._cache_ttl = 60  # 60 秒内不重复扫
+        self._lock = threading.Lock()
+
+    # ---------- 底层：查模型列表 ----------
+    def _fetch_models(self, force=False):
+        """从 Ollama /api/tags 拉取所有本地模型（带缓存）。"""
+        now = time.time()
+        with self._lock:
+            if (not force
+                and self._cache is not None
+                and (now - self._cache_time) < self._cache_ttl):
+                return self._cache
+
+            models = self._query_ollama()
+            self._cache = models
+            self._cache_time = now
+            return models
+
+    def _query_ollama(self):
+        """快速探测 + 拉模型列表。探测超时 0.3 秒，避免登录卡 6 秒。"""
+        import socket
+        # ★ 先做端口探测，0.3 秒内连不上就直接返回空
+        ollama_alive = False
+        for host in ("127.0.0.1", "localhost"):
+            try:
+                s = socket.create_connection((host, 11434), timeout=0.3)
+                s.close()
+                ollama_alive = True
+                break
+            except Exception:
+                continue
+
+        if not ollama_alive:
+            return []   # Ollama 未运行，直接空
+
+        # ★ 只对确定能连上的 host 发请求
+        try:
+            import urllib.request
+            for host in ("127.0.0.1", "localhost"):
+                try:
+                    url = f"http://{host}:11434/api/tags"
+                    req = urllib.request.urlopen(url, timeout=2)
+                    data = json.loads(req.read())
+                    result = []
+                    for m in data.get("models", []):
+                        name = m.get("name", "")
+                        size = m.get("size", 0)
+                        if name:
+                            result.append({"name": name, "size": size})
+                    return result
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return []
+
+    # ---------- 分类 ----------
+    @staticmethod
+    def _is_vision(name):
+        nl = name.lower()
+        return any(kw in nl for kw in ModelRegistry.VISION_KEYWORDS)
+
+    def list_all(self):
+        return self._fetch_models()
+
+    def list_vision_models(self):
+        return [m for m in self._fetch_models() if self._is_vision(m["name"])]
+
+    def list_text_models(self):
+        return [m for m in self._fetch_models() if not self._is_vision(m["name"])]
+
+    # ---------- 智能选择 ----------
+    def pick_vision_model(self):
+        """挑视觉模型：只用缓存，不主动请求。"""
+        with self._lock:
+            if self._cache is None:
+                return None
+            models = [m for m in self._cache if self._is_vision(m["name"])]
+        if not models:
+            return None
+        models.sort(key=lambda m: m["size"], reverse=True)
+        return models[0]["name"]
+
+    def pick_text_model(self, max_size_gb=20, prefer_large=True):
+        """挑文本模型：只用缓存，不主动请求。"""
+        with self._lock:
+            if self._cache is None:
+                return None
+            models = [m for m in self._cache if not self._is_vision(m["name"])]
+        if not models:
+            return None
+        max_bytes = max_size_gb * 1024 * 1024 * 1024
+        candidates = [m for m in models if m["size"] <= max_bytes]
+        if not candidates:
+            models.sort(key=lambda m: m["size"])
+            return models[0]["name"]
+        candidates.sort(key=lambda m: m["size"], reverse=prefer_large)
+        return candidates[0]["name"]
+
+    def pick_small_text_model(self, max_size_gb=10):
+        """挑小模型：给多代理这种高频调用场景用。"""
+        return self.pick_text_model(max_size_gb=max_size_gb, prefer_large=True)
+
+    # ---------- 名字解析 ----------
+    def resolve(self, name):
+        """
+        把用户输入的模型名解析成实际存在的完整名。
+        ★ 只在缓存有数据时查缓存；缓存为空时不发网络请求。
+        """
+        if not name:
+            return None
+
+        # 只查缓存，不主动拉
+        with self._lock:
+            if self._cache is None:
+                return name   # 缓存空，原样返回
+            names = [m["name"] for m in self._cache]
+
+        if name in names:
+            return name
+        base = name.split(":")[0]
+        for n in names:
+            if n.split(":")[0] == base:
+                return n
+        for n in names:
+            if name in n or n in name:
+                return n
+        return name   # 找不到也原样返回，别阻塞
+
+    def exists(self, name):
+        return self.resolve(name) is not None
+
+    # ---------- 报告 ----------
+    def report(self):
+        """返回一份人类可读的模型清单报告。"""
+        lines = []
+        all_models = self.list_all()
+        if not all_models:
+            return "未检测到任何本地模型（Ollama 未运行或无模型）"
+
+        vision = self.list_vision_models()
+        text = self.list_text_models()
+
+        lines.append(f"📦 共 {len(all_models)} 个本地模型")
+        lines.append("")
+        lines.append(f"👁️ 视觉模型（{len(vision)} 个）:")
+        for m in sorted(vision, key=lambda x: x["size"], reverse=True):
+            gb = m["size"] / (1024 ** 3)
+            lines.append(f"  {m['name']:30} {gb:.1f} GB")
+        if not vision:
+            lines.append("  （无）")
+
+        lines.append("")
+        lines.append(f"📝 文本模型（{len(text)} 个）:")
+        for m in sorted(text, key=lambda x: x["size"], reverse=True):
+            gb = m["size"] / (1024 ** 3)
+            lines.append(f"  {m['name']:30} {gb:.1f} GB")
+        if not text:
+            lines.append("  （无）")
+
+        lines.append("")
+        lines.append(f"🎯 自动选择结果：")
+        lines.append(f"  视觉模型 → {self.pick_vision_model() or '（无可用）'}")
+        lines.append(f"  默认文本模型 → {self.pick_text_model() or '（无可用）'}")
+        lines.append(f"  小模型（多代理用） → {self.pick_small_text_model() or '（无可用）'}")
+        return "\n".join(lines)
+
+        
 class UnifiedAIEngine:
     """
-    整合 virtual_os.py 的 AI 优势：思考过程、JSON工具调用、自动检测Ollama、语音合成。
-    同时兼容 kiki_os.py 原有的离线规则和动作（内置 _offline_reply）。
+    整合离线规则 + 在线模型 + JSON 工具调用 + 多代理 + 语音合成。
+    已移除所有屏幕控制/视觉识别工具。
     """
 
     def __init__(self, shell):
@@ -12898,31 +13845,79 @@ class UnifiedAIEngine:
         self.reply_callback = None
         self._model_user_choice = None
         self._popup_parent = None
+        self._current_chat_target = "terminal"
 
+        # ==================== 工具清单（已扩展） ====================
         self.tools = [
+            # ---- 打开应用/窗口 ----
             {"name": "open_file_manager", "description": "打开文件管理器", "args": {}},
-            {"name": "open_terminal", "description": "打开终端", "args": {}},
-            {"name": "open_browser", "description": "打开浏览器", "args": {}},
+            {"name": "open_terminal", "description": "打开终端窗口", "args": {}},
+            {"name": "open_browser", "description": "打开浏览器", "args": {"url": "string(可选)"}},
+            {"name": "open_calculator", "description": "打开计算器", "args": {}},
+            {"name": "open_editor", "description": "打开文本编辑器", "args": {"path": "string(可选)"}},
+            {"name": "open_settings", "description": "打开系统设置面板", "args": {}},
             {"name": "open_recycle_bin", "description": "打开回收站", "args": {}},
             {"name": "open_documents", "description": "打开文档目录", "args": {}},
+            {"name": "open_desktop", "description": "打开桌面目录", "args": {}},
             {"name": "open_ai_assistant", "description": "打开AI助手窗口", "args": {}},
-            {"name": "new_folder", "description": "创建文件夹", "args": {"folder_name": "string"}},
-            {"name": "new_file", "description": "创建文件", "args": {"file_path": "string", "content": "string"}},
-            {"name": "write_file", "description": "写入文件", "args": {"file_path": "string", "content": "string"}},
+            {"name": "open_task_manager", "description": "打开任务管理器", "args": {}},
+            {"name": "open_system_monitor", "description": "打开系统监控", "args": {}},
+            {"name": "open_workspace", "description": "打开工作区管理器", "args": {}},
+            {"name": "open_app_store", "description": "打开应用商店", "args": {}},
+            {"name": "open_paint", "description": "打开画图程序", "args": {}},
+
+            # ---- 文件操作 ----
+            {"name": "new_folder", "description": "创建文件夹", "args": {"path": "string"}},
+            {"name": "new_file", "description": "创建文件", "args": {"path": "string", "content": "string(可选)"}},
+            {"name": "write_file", "description": "写入文件内容", "args": {"path": "string", "content": "string"}},
+            {"name": "read_file", "description": "读取文件内容", "args": {"path": "string"}},
+            {"name": "delete", "description": "把文件移入回收站", "args": {"path": "string"}},
+            {"name": "permanent_delete", "description": "永久删除文件（不可恢复）", "args": {"path": "string"}},
             {"name": "rename", "description": "重命名文件或文件夹", "args": {"old_path": "string", "new_name": "string"}},
-            {"name": "delete", "description": "移入回收站", "args": {"path": "string"}},
-            {"name": "empty_trash", "description": "清空回收站", "args": {}},
             {"name": "move", "description": "移动文件", "args": {"src": "string", "dst": "string"}},
             {"name": "copy", "description": "复制文件", "args": {"src": "string", "dst": "string"}},
+            {"name": "list_dir", "description": "列出当前目录内容", "args": {}},
             {"name": "cd", "description": "切换工作目录", "args": {"path": "string"}},
-            {"name": "list_dir", "description": "列出当前目录", "args": {}},
-            {"name": "execute_command", "description": "在终端执行命令", "args": {"command": "string"}},
-            {"name": "read_file", "description": "读取文件内容", "args": {"path": "string"}},
-            {"name": "search_file", "description": "搜索文件", "args": {"keyword": "string"}},
+            {"name": "search_file", "description": "在当前目录搜索文件名包含关键词的文件", "args": {"keyword": "string"}},
+            {"name": "empty_trash", "description": "清空回收站", "args": {}},
+
+            # ---- 系统操作 ----
+            {"name": "execute_command", "description": "在终端执行任意 KIKI OS 命令", "args": {"command": "string"}},
+            {"name": "reboot", "description": "重启系统", "args": {}},
+            {"name": "shutdown", "description": "关机", "args": {}},
+            {"name": "show_time", "description": "显示当前时间", "args": {}},
+            {"name": "show_date", "description": "显示当前日期", "args": {}},
+            {"name": "system_info", "description": "显示系统信息", "args": {}},
+            {"name": "memory_info", "description": "显示内存信息", "args": {}},
+            {"name": "disk_info", "description": "显示磁盘使用情况", "args": {}},
+            {"name": "process_list", "description": "显示运行中的进程列表", "args": {}},
+
+            # ---- 用户管理 ----
+            {"name": "list_users", "description": "列出所有用户（需管理员）", "args": {}},
+            {"name": "add_user", "description": "创建新用户（需管理员）", "args": {"username": "string", "password": "string"}},
+            {"name": "delete_user", "description": "删除指定用户（需管理员）", "args": {"username": "string"}},
+            {"name": "change_password", "description": "修改当前用户密码", "args": {"new_password": "string"}},
+            {"name": "whoami", "description": "显示当前用户名", "args": {}},
+
+            # ---- 网络 / 工具 ----
+            {"name": "ping", "description": "ping 主机测试网络", "args": {"host": "string"}},
+            {"name": "download", "description": "从 URL 下载文件到 VFS", "args": {"url": "string", "dest": "string(可选)"}},
+            {"name": "weather", "description": "查询城市天气", "args": {"city": "string"}},
+            {"name": "calc", "description": "数学计算", "args": {"expr": "string"}},
+
+            # ---- 配置 / 主题 ----
+            {"name": "get_setting", "description": "读取系统设置", "args": {"key": "string"}},
+            {"name": "set_setting", "description": "修改系统设置（需管理员）", "args": {"key": "string", "value": "string"}},
+            {"name": "change_wallpaper", "description": "更改桌面壁纸颜色", "args": {"color": "string(如 #1e1e1e)"}},
+            {"name": "change_language", "description": "切换界面语言", "args": {"lang": "string(en/zh)"}},
+
+            # ---- 游戏 / 娱乐 ----
+            {"name": "launch_game", "description": "启动游戏，可选：snake/minesweeper/tetris/game2048/guess/typing/tictac/breakout", "args": {"game": "string"}},
         ]
 
         self.tools_desc = "\n".join(
-            [f"- {t['name']}: {t['description']} (参数: {json.dumps(t['args'])})" for t in self.tools]
+            [f"- {t['name']}: {t['description']} (参数: {json.dumps(t['args'], ensure_ascii=False)})"
+             for t in self.tools]
         )
 
         self.system_prompt = (
@@ -12933,19 +13928,21 @@ class UnifiedAIEngine:
             "你有以下工具可用：\n"
             f"{self.tools_desc}\n"
             "当用户请求涉及这些工具时，请以 JSON 格式输出调用指令，每行一个，例如：\n"
-            '{"tool": "new_folder", "args": {"folder_name": "test"}}\n'
+            '{"tool": "new_folder", "args": {"path": "test"}}\n'
             "如果一次需要多个动作，可以连续输出多行 JSON，系统会按顺序执行。\n"
             "如果用户只是普通对话，直接正常回答，不要添加工具 JSON。\n"
             "【路径规则】\n"
             "当用户提到文件名而未给出完整路径时，优先使用当前工作目录。\n"
             "除非用户明确说\"桌面\"，否则不要默认使用 Desktop。\n"
+            "【禁止事项】\n"
+            "不要调用未在上面列出的工具。不要编造工具名。\n"
         )
 
         self.detect_local_ollama()
 
-    # ---------- 模型检测 ----------
+    # ==================== 模型检测 ====================
     def detect_local_ollama(self):
-        """检测本机 Ollama 服务，只填充 available_models，不自动启用"""
+        """检测本机 Ollama 服务，填充 available_models"""
         try:
             import urllib.request
             for host in ("127.0.0.1", "localhost"):
@@ -12976,11 +13973,59 @@ class UnifiedAIEngine:
         else:
             return "未就绪", None
 
+    def get_text_models(self):
+        """获取本地可用的文本模型列表。"""
+        if not hasattr(self.shell, "model_registry"):
+            # 兜底：直接从 Ollama 拉
+            self.detect_local_ollama()
+            from kiki_os import ModelRegistry
+            return [m for m in self.available_models]
+        return [m["name"] for m in self.shell.model_registry.list_text_models()]
+
+    def get_vision_models(self):
+        """获取本地可用的视觉模型列表（暂无视觉功能，保留接口）。"""
+        if not hasattr(self.shell, "model_registry"):
+            return []
+        return [m["name"] for m in self.shell.model_registry.list_vision_models()]
+
     def _try_enable_model_sync(self):
-        """尝试启用在线模型，返回True表示使用在线，False表示离线（必须在主线程调用）"""
+        """
+        决定是否启用在线模型。
+        优先级：
+          1. 本次会话已决定 → 直接返回
+          2. 配置里 online_enabled=True 且 model 有效 → 直接启用
+          3. 配置里 online_enabled=False → 直接离线
+          4. OpenAI 等 API key 已配置 → 用远程
+          5. 本地有文本模型 → 弹窗让用户选
+          6. 都没有 → 离线
+        返回 True=在线，False=离线。
+        """
+        # ---------- 1. 本次会话已决定 ----------
         if self._model_user_choice is not None:
             return self._model_user_choice
 
+        # ---------- 2. 读持久化配置 ----------
+        saved_choice = self.shell.config.get("ai.online_enabled", None)
+        saved_model = self.shell.config.get("ai.model", "")
+
+        # 用户之前明确选了"启用在线"
+        if saved_choice is True and saved_model and saved_model not in ("auto", "mock", ""):
+            available = self.get_text_models()
+            if available and saved_model in available:
+                self.provider = "ollama"
+                self.model = saved_model
+                self._model_user_choice = True
+                return True
+            # 模型已不存在，落到弹窗逻辑重新选
+
+        # 用户之前明确选了"离线"
+        if saved_choice is False:
+            self.provider = None
+            self.model = None
+            self._model_user_choice = False
+            return False
+
+        # ---------- 3. 远程 API 已配置 ----------
         conf_provider = self.shell.config.get("ai.provider", "mock")
         api_key = self.shell.config.get("ai.api_key", "")
         if conf_provider not in ("mock", "") and api_key:
@@ -12989,79 +14034,353 @@ class UnifiedAIEngine:
             self._model_user_choice = True
             return True
 
-        if self.available_models:
-            if hasattr(self.shell, "gui_app") and self.shell.gui_app and self.shell.gui_app.winfo_exists():
-                from tkinter import messagebox
-                parent_win = self._popup_parent if self._popup_parent and self._popup_parent.winfo_exists() else self.shell.gui_app
-                resp = messagebox.askyesno(
-                    "发现本地 AI 引擎",
-                    f"检测到本地 Ollama 模型：{self.available_models[0]}\n\n是否启用在线 AI？\n选择\"否\"将使用离线模式。",
-                    parent=parent_win,
+        # ---------- 4. 找本地文本模型 ----------
+        text_models = self.get_text_models()
+        if not text_models and hasattr(self.shell, "model_registry"):
+            text_models = [m["name"] for m in self.shell.model_registry.list_text_models()]
+
+        if not text_models:
+            # 兜底：从 available_models 里过滤视觉模型
+            VISION_KW = (
+                "llava", "vision", "minicpm-v", "moondream", "bakllava",
+                "qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl",
+                "cogvlm", "pixtral", "internvl",
+            )
+            text_models = [
+                m for m in self.available_models
+                if not any(k in m.lower() for k in VISION_KW)
+            ]
+
+        # 没有任何文本模型 → 离线
+        if not text_models:
+            self._model_user_choice = False
+            return False
+
+        # ---------- 5. 弹窗让用户选模型 ----------
+        if saved_model and saved_model in text_models:
+            default_choice = saved_model
+        else:
+            default_choice = text_models[0]
+
+        # GUI 环境
+        if hasattr(self.shell, "gui_app") and self.shell.gui_app \
+                and self.shell.gui_app.winfo_exists():
+            try:
+                parent_win = (
+                    self._popup_parent
+                    if self._popup_parent and self._popup_parent.winfo_exists()
+                    else self.shell.gui_app
                 )
-                if resp:
-                    self.provider = "ollama"
-                    self.model = self.available_models[0]
-                    self._model_user_choice = True
-                    return True
-                else:
+                # 确保在主线程
+                import threading
+                if threading.current_thread() is not threading.main_thread():
+                    return False
+                chosen = self._ask_model_choice(parent_win, text_models, default_choice)
+
+                if chosen is None:
+                    # 用户点了取消 → 本次会话离线，不持久化
                     self.provider = None
                     self.model = None
                     self._model_user_choice = False
                     return False
-            else:
-                print(f"检测到本地 Ollama 模型 {self.available_models[0]}，但当前非 GUI 环境，默认使用离线模式。")
+
+                kind, model_name = chosen
+
+                if kind == "offline":
+                    self.provider = None
+                    self.model = None
+                    self._model_user_choice = False
+                    try:
+                        self.shell.config.set("ai.online_enabled", False, self.username)
+                        self.shell.config.set("ai.model", "", self.username)
+                        self.shell.config.save_user_config(self.username)
+                    except Exception:
+                        pass
+                    return False
+
+                elif kind == "online":
+                    # 在线 AI：使用配置里的 provider / model / base_url
+                    provider = self.shell.config.get("ai.provider", "openai")
+                    model_name = self.shell.config.get("ai.model", "gpt-3.5-turbo")
+                    self.provider = provider
+                    self.model = model_name
+                    self._model_user_choice = True
+                    try:
+                        self.shell.config.set("ai.online_enabled", True, self.username)
+                        self.shell.config.save_user_config(self.username)
+                    except Exception:
+                        pass
+                    return True
+
+                else:  # kind == "ollama"
+                    self.provider = "ollama"
+                    self.model = model_name
+                    self._model_user_choice = True
+                    try:
+                        self.shell.config.set("ai.model", model_name, self.username)
+                        self.shell.config.set("ai.online_enabled", True, self.username)
+                        self.shell.config.save_user_config(self.username)
+                    except Exception:
+                        pass
+                    return True
+            except Exception as e:
+                # 弹窗失败，退回离线
+                try:
+                    print(f"⚠️ 模型选择弹窗失败: {e}")
+                except Exception:
+                    pass
                 self._model_user_choice = False
                 return False
 
-        self._model_user_choice = False
-        return False
+        # 非 GUI：默认使用第一个模型
+        self.provider = "ollama"
+        self.model = default_choice
+        self._model_user_choice = True
+        try:
+            self.shell.config.set("ai.model", default_choice, self.username)
+            self.shell.config.set("ai.online_enabled", True, self.username)
+            self.shell.config.save_user_config(self.username)
+        except Exception:
+            pass
+        return True
 
-    # ---------- 对话入口 ----------
-    def chat(self, user_input):
+    # ==================== 对话入口 ====================
+    def _ask_model_choice(self, parent, models, default):
+        """
+        弹出模型选择对话框。
+        选项 = 离线模式 + 在线 AI（如配置了 base_url）+ 所有本地 Ollama 模型
+        models: 本地 Ollama 文本模型名列表
+        default: 默认选中的模型名
+        返回: ("offline", None) / ("online", None) / ("ollama", 模型名) / None(取消)
+        """
+        import tkinter as tk
+
+        result = {"value": None}
+
+        # 是否配置了在线 AI（base_url + api_key）
+        has_online_ai = False
+        try:
+            base_url = self.shell.config.get("ai.base_url", "")
+            api_key = self.shell.config.get("ai.api_key", "")
+            provider = self.shell.config.get("ai.provider", "mock")
+            if provider not in ("mock", "ollama", "") and base_url and api_key:
+                has_online_ai = True
+        except Exception:
+            pass
+
+        # 构造选项列表: [(显示文本, (kind, model_name))]
+        options = []
+        options.append(("📴 离线模式（不联网，规则匹配）", ("offline", None)))
+        if has_online_ai:
+            provider = self.shell.config.get("ai.provider", "openai")
+            model_name = self.shell.config.get("ai.model", "gpt-3.5-turbo")
+            options.append((f"🌐 在线 AI（{provider} / {model_name}）", ("online", None)))
+        for m in models:
+            options.append((f"🖥️ 本地 Ollama: {m}", ("ollama", m)))
+
+        dlg = tk.Toplevel(parent)
+        dlg.title("选择 AI 引擎")
+        dlg.geometry("460x420")
+        dlg.resizable(False, False)
+        dlg.transient(parent)
+        dlg.grab_set()
+
+        tk.Label(
+            dlg, text="选择 AI 引擎模式", font=("Microsoft YaHei", 13, "bold"), pady=10
+        ).pack()
+
+        tk.Label(
+            dlg, text="选择后本次会话生效，可随时用 `ai provider` 查看",
+            font=("Microsoft YaHei", 9), fg="#888"
+        ).pack(pady=(0, 8))
+
+        list_frame = tk.Frame(dlg)
+        list_frame.pack(fill="both", expand=True, padx=20, pady=5)
+
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side="right", fill="y")
+
+        listbox = tk.Listbox(
+            list_frame,
+            yscrollcommand=scrollbar.set,
+            font=("Microsoft YaHei", 10),
+            selectmode=tk.SINGLE,
+            activestyle="none",
+            height=10,
+        )
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=listbox.yview)
+
+        for text, _ in options:
+            listbox.insert(tk.END, "  " + text)
+
+        # 默认选中
+        default_idx = 0
+        for i, (_, val) in enumerate(options):
+            if val[0] == "ollama" and val[1] == default:
+                default_idx = i
+                break
+        listbox.selection_set(default_idx)
+        listbox.activate(default_idx)
+        listbox.see(default_idx)
+
+        def confirm():
+            sel = listbox.curselection()
+            if sel:
+                result["value"] = options[sel[0]][1]
+            dlg.destroy()
+
+        def cancel():
+            result["value"] = None
+            dlg.destroy()
+
+        listbox.bind("<Double-Button-1>", lambda e: confirm())
+        listbox.bind("<Return>", lambda e: confirm())
+
+        btn_frame = tk.Frame(dlg)
+        btn_frame.pack(pady=10)
+
+        tk.Button(
+            btn_frame, text="确定", width=10, bg="#4a9eff", fg="white", command=confirm
+        ).pack(side="left", padx=8)
+
+        tk.Button(
+            btn_frame, text="取消", width=10, command=cancel
+        ).pack(side="left", padx=8)
+
+        # 居中显示
+        dlg.update_idletasks()
+        w = dlg.winfo_width()
+        h = dlg.winfo_height()
+        px = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+        py = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+        dlg.geometry(f"+{px}+{py}")
+
+        dlg.wait_window()
+        return result["value"]
+    
+    def chat(self, user_input, target="terminal", reply_callback=None):
+        """target: "chat"=AI窗口 / "terminal"=终端"""
         if not user_input.strip():
             return
+        # ★ 记录当前对话目标，供内部打印方法使用
+        self._current_chat_target = target
         self.messages.append({"role": "user", "content": user_input})
-        threading.Thread(target=self._do_chat_work, daemon=True).start()
+        threading.Thread(
+            target=self._do_chat_work,
+            args=(target, reply_callback),
+            daemon=True,
+        ).start()
 
-    def _do_chat_work(self):
+    def ask_sync(self, user_input):
+        """同步版本的 chat，返回 (reply, emoji)。供命令 ai 使用。"""
+        if not user_input.strip():
+            return "", "🤖"
+
+        # ★ 保险：万一路径没触发，这里再兜一次
+        if self._model_user_choice is None:
+            try:
+                self._try_enable_model_sync()
+            except Exception as e:
+                print(f"[AI] 启用在线模型失败: {e}")
+
+        # 复杂多步骤 → 多代理
+        if user_input.strip().startswith(("多代理:", "multi:")):
+            return self.handle_multi_agent_sync(user_input)
+
+        if self._is_complex_multi_step(user_input) and self.provider == "ollama":
+            return self.handle_multi_agent_sync(user_input)
+
+        try:
+            if self.provider == "ollama":
+                # ★ 前置检查：Ollama 说要用但实际上不可达 → 回退离线
+                if not self._quick_check_ollama():
+                    print("⚠️ Ollama 不可达，自动回退离线模式")
+                    return self._offline_reply(user_input)
+                reply = self._query_ollama(self.model, [{"role": "user", "content": user_input}])
+            elif self.provider and self.provider != "ollama":
+                reply = self._query_litellm(self.provider, self.model, [{"role": "user", "content": user_input}])
+            else:
+                return self._offline_reply(user_input)
+
+            # 思考提取
+            thinking = self.extract_thinking(reply)
+            reply_body = self.remove_thinking(reply)
+
+            if thinking:
+                self._emit_thinking(thinking, target="terminal", callback=None)
+
+            # ★ 从 thinking 和正文两处都找工具调用
+            actions = self.parse_tool_calls(reply)
+            if not actions and thinking:
+                actions = self.parse_tool_calls(thinking)
+
+            if actions:
+                # ask_sync 场景固定走终端输出
+                self.shell._ai_output_target = "terminal"
+                self.shell._ai_chat_callback = None
+                try:
+                    success, fail, fail_msgs = self.shell._execute_ai_actions(actions)
+                finally:
+                    self.shell._ai_output_target = "terminal"
+                    self.shell._ai_chat_callback = None
+
+                if fail == 0:
+                    reply = f"✅ 已成功执行 {success} 个操作。"
+                elif success == 0:
+                    reply = f"❌ 操作失败（{fail} 个）：\n" + "\n".join(fail_msgs[:3])
+                else:
+                    reply = f"⚠️ 部分成功：{success} 个成功，{fail} 个失败。\n失败详情：\n" + "\n".join(fail_msgs[:3])
+
+            return reply, "🤖"
+        except Exception as e:
+            return f"AI 错误: {e}", "❌"
+
+    def _do_chat_work(self, target="terminal", reply_callback=None):
         try:
             user_text = self.messages[-1]["content"]
 
-            # 1. 显式多代理指令拦截
+            # 显式多代理
             if user_text.strip().startswith(("多代理:", "multi:")):
-                self._handle_multi_agent(user_text)
+                reply, emoji = self._handle_multi_agent(user_text)
+                self._emit_reply(reply, emoji, target=target, callback=reply_callback)
                 return
 
-            # 2. 复杂多步骤指令 → 自动转多代理（仅 Ollama 可用时）
+            # 复杂多步骤 → 多代理
             if self._is_complex_multi_step(user_text) and self.provider == "ollama":
-                self._handle_multi_agent(user_text)
+                reply, emoji = self._handle_multi_agent(user_text)
+                self._emit_reply(reply, emoji, target=target, callback=reply_callback)
                 return
 
-            # 3. 在线模型调用
+            # 在线模型
             if self.provider == "ollama":
                 reply = self._query_ollama(self.model, self.messages)
-            elif self.provider and HAS_LITELLM:
+            elif self.provider and self.provider != "ollama":
                 reply = self._query_litellm(self.provider, self.model, self.messages)
             else:
-                # 离线兜底
                 reply, emoji = self._offline_reply(user_text)
                 self.messages.append({"role": "assistant", "content": reply})
-                self._emit_reply(reply, emoji)
+                self._emit_reply(reply, emoji, target=target, callback=reply_callback)
                 return
 
-            # 提取思考
+            # 思考提取
             thinking = self.extract_thinking(reply)
-            if thinking:
-                self._emit_thinking(thinking)
-                reply = self.remove_thinking(reply)
+            reply_body = self.remove_thinking(reply)
 
-            # 解析工具调用
-            actions = self.parse_tool_calls(reply)
+            if thinking:
+                self._emit_thinking(thinking, target=target, callback=None)
+
+            # ★ 关键修复：从 thinking 和正文两处都找工具调用
+            actions = self.parse_tool_calls(reply)  # 从原文找
+            if not actions and thinking:
+                # 原文里没有，去 thinking 里再找
+                actions = self.parse_tool_calls(thinking)
             if actions:
-                # 根据调用来源设置输出目标
-                if self.reply_callback:
+                if target == "chat":
                     self.shell._ai_output_target = "chat"
-                    self.shell._ai_chat_callback = lambda msg: self._emit_reply(msg, "🔧")
+                    self.shell._ai_chat_callback = lambda msg: self._emit_reply(
+                        msg, "🔧", target="chat", callback=reply_callback
+                    )
                 else:
                     self.shell._ai_output_target = "terminal"
                     self.shell._ai_chat_callback = None
@@ -13071,7 +14390,6 @@ class UnifiedAIEngine:
                     self.shell._ai_output_target = "terminal"
                     self.shell._ai_chat_callback = None
 
-                # 根据结果生成准确的回复
                 if fail == 0:
                     reply = f"✅ 已成功执行 {success} 个操作。"
                 elif success == 0:
@@ -13080,81 +14398,186 @@ class UnifiedAIEngine:
                     reply = f"⚠️ 部分成功：{success} 个成功，{fail} 个失败。\n失败详情：\n" + "\n".join(fail_msgs[:3])
 
             self.messages.append({"role": "assistant", "content": reply})
-            self._emit_reply(reply, "🤖")
+            self._emit_reply(reply, "🤖", target=target, callback=reply_callback)
 
         except Exception as e:
             error_msg = f"AI 请求失败: {e}"
-            self._emit_reply(error_msg, "❌")
+            self._emit_reply(error_msg, "❌", target=target, callback=reply_callback)
 
     def ask_voice(self, text, callback):
         """语音模式：后台执行 AI，结果通过 callback(reply, emoji) 返回主线程"""
         import threading
+        import time
+
+        # 用字典在线程间传结果，避免闭包变量共享的坑
+        result = {"done": False, "reply": None, "emoji": None}
+        dispatched = {"flag": False}
+
+        def _safe_dispatch(reply, emoji):
+            # 保证 callback 只被调用一次
+            if dispatched["flag"]:
+                return
+            dispatched["flag"] = True
+            try:
+                callback(reply, emoji)
+            except Exception as e:
+                print(f"[语音] 回调失败: {e}")
 
         def work():
             try:
-                if self.provider == "ollama":
-                    reply = self._query_ollama(self.model, [{"role": "user", "content": text}])
-                elif self.provider and HAS_LITELLM:
-                    reply = self._query_litellm(self.provider, self.model, [{"role": "user", "content": text}])
-                else:
-                    reply, emoji = self._offline_reply(text)
-                    self.shell.gui_app.after(0, lambda: callback(reply, emoji))
-                    return
-
-                thinking = self.extract_thinking(reply)
-                if thinking:
-                    reply = self.remove_thinking(reply)
-
-                actions = self.parse_tool_calls(reply)
-                if actions:
-                    if self.reply_callback:
-                        self.shell._ai_output_target = "chat"
-                        self.shell._ai_chat_callback = lambda msg: self._emit_reply(msg, "🔧")
-                    else:
-                        self.shell._ai_output_target = "terminal"
-                        self.shell._ai_chat_callback = None
-                    try:
-                        self.shell._execute_ai_actions(actions)
-                    finally:
-                        self.shell._ai_output_target = "terminal"
-                        self.shell._ai_chat_callback = None
-                    reply = "✅ 已根据您的指令完成操作。"
-
-                self.shell.gui_app.after(0, lambda: callback(reply, "🤖"))
+                reply, emoji = self.ask_sync(text)
+                result["reply"] = reply
+                result["emoji"] = emoji
             except Exception as e:
-                self.shell.gui_app.after(0, lambda: callback(f"AI 错误: {e}", "❌"))
+                result["reply"] = f"AI 错误: {e}"
+                result["emoji"] = "❌"
+            finally:
+                result["done"] = True
+                # 回到主线程调 callback
+                try:
+                    if hasattr(self.shell, "gui_app") and self.shell.gui_app:
+                        self.shell.gui_app.after(
+                            0,
+                            lambda: _safe_dispatch(result["reply"], result["emoji"] or "🤖"),
+                        )
+                    else:
+                        _safe_dispatch(result["reply"], result["emoji"] or "🤖")
+                except Exception as e:
+                    print(f"[语音] 调度回调失败: {e}")
+
+        def timeout_watchdog():
+            t0 = time.time()
+            while not result["done"] and (time.time() - t0) < 30:
+                time.sleep(0.5)
+            if not result["done"]:
+                print("⏱️ AI 处理超过 30 秒，强制返回超时提示")
+                try:
+                    if hasattr(self.shell, "gui_app") and self.shell.gui_app:
+                        self.shell.gui_app.after(
+                            0,
+                            lambda: _safe_dispatch(
+                                "⏱️ AI 处理超时（可能 Ollama 未响应）。\n请稍后重试，或先用 'ai provider' 检查状态。",
+                                "⏱️",
+                            ),
+                        )
+                    else:
+                        _safe_dispatch("⏱️ AI 处理超时", "⏱️")
+                except Exception as e:
+                    print(f"[语音] 超时回调失败: {e}")
 
         threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=timeout_watchdog, daemon=True).start()
 
     def _is_complex_multi_step(self, text):
-        """判断是否为复杂多步骤指令"""
-        action_keywords = [
-            "打开", "创建", "新建", "写入", "删除", "移动", "复制", "重命名",
-            "关闭", "启动", "运行", "下载", "搜索", "列出", "查看", "计算", "翻译"
-        ]
-        connectors = ["再", "然后", "接着", "之后", "最后", "并且"]
-        if any(connector in text for connector in connectors):
-            return True
-        present = {kw for kw in action_keywords if kw in text}
-        return len(present) >= 2
+        """判定是否要走多代理：只有出现明确的连接词才认为是复杂多步任务。"""
+        connectors = ["再", "然后", "接着", "之后", "最后", "并且", "，再", ",再"]
+        return any(c in text for c in connectors)
 
-    def _emit_reply(self, reply, emoji="🤖"):
-        if self.reply_callback:
-            self.reply_callback(reply, emoji)
-        elif hasattr(self.shell, "gui_app") and self.shell.gui_app:
-            self.shell.gui_app._show_ai_reply(reply, emoji)
-        else:
-            print(f"AI: {reply}")
+    # ==================== 输出分发 ====================
+    def _emit_reply(self, reply, emoji="🤖", target="terminal", callback=None):
+        # 1. 显式 callback 优先（AI 窗口 send_message 会传这个）
+        if callback:
+            try:
+                callback(reply, emoji)
+                return
+            except Exception:
+                pass
 
-    def _emit_thinking(self, thinking):
-        if self.thinking_callback:
-            self.thinking_callback(thinking)
-        elif hasattr(self.shell, "gui_app") and self.shell.gui_app:
-            self.shell.gui_app._show_thinking(thinking)
-        else:
-            print(f"🧠 思考: {thinking}")
+        # 2. chat 目标：走全局 reply_callback，不 fallback 到终端
+        if target == "chat":
+            if self.reply_callback:
+                try:
+                    self.reply_callback(reply, emoji)
+                    return
+                except Exception:
+                    pass
+            # chat 模式但回调不可用 → 静默丢弃
+            return
 
-    # ---------- 思考提取 ----------
+        # 3. terminal 目标：走终端
+        gui = getattr(self.shell, "gui_app", None)
+        if gui is not None:
+            try:
+                if gui.winfo_exists():
+                    if hasattr(gui, "_show_ai_reply"):
+                        try:
+                            gui._show_ai_reply(reply, emoji)
+                            return
+                        except Exception:
+                            pass
+                    if hasattr(gui, "_print"):
+                        try:
+                            gui._print(f"{emoji} AI: {reply}\n")
+                            return
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        print(f"AI: {reply}")
+
+    def _log_progress(self, msg, target=None):
+        """进度日志：根据当前对话目标决定输出去向。
+        - target="chat"：只进 AI 聊天窗口（走 thinking_callback），不进终端
+        - target="terminal"：只进终端
+        """
+        if target is None:
+            target = getattr(self, "_current_chat_target", "terminal")
+
+        if target == "chat":
+            if self.thinking_callback:
+                try:
+                    self.thinking_callback(msg)
+                    return
+                except Exception:
+                    pass
+            # chat 模式但回调不可用 → 静默丢弃，绝不 fallback 到终端
+            return
+
+        # target=terminal
+        gui = getattr(self.shell, "gui_app", None)
+        if gui is not None:
+            try:
+                if gui.winfo_exists() and hasattr(gui, "_print"):
+                    gui._print(msg + "\n")
+                    return
+            except Exception:
+                pass
+        print(msg)
+
+    def _emit_thinking(self, thinking, target="terminal", callback=None):
+        # 1. chat 目标：只走 thinking_callback，不做终端 fallback
+        if target == "chat":
+            if self.thinking_callback:
+                try:
+                    self.thinking_callback(thinking)
+                    return
+                except Exception:
+                    pass
+            # chat 模式但回调不可用 → 静默丢弃
+            return
+
+        # 2. terminal 目标：走终端
+        gui = getattr(self.shell, "gui_app", None)
+        if gui is not None:
+            try:
+                if gui.winfo_exists():
+                    if hasattr(gui, "_show_thinking"):
+                        try:
+                            gui._show_thinking(thinking)
+                            return
+                        except Exception:
+                            pass
+                    if hasattr(gui, "_print"):
+                        try:
+                            gui._print(f"🧠 思考: {thinking}\n")
+                            return
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        print(f"🧠 思考: {thinking}")
+
+    # ==================== 思考标签 ====================
     @staticmethod
     def extract_thinking(text):
         import re
@@ -13166,59 +14589,109 @@ class UnifiedAIEngine:
         import re
         return re.sub(r'\[THINKING\].*?\[/THINKING\]', '', text, flags=re.DOTALL).strip()
 
-    # ---------- 工具解析（JSON） ----------
+    # ==================== 工具解析 ====================
     def parse_tool_calls(self, text):
+        """把 AI 回复中的 JSON 工具调用解析成 action 元组列表。"""
         import re
         actions = []
+
+        SIMPLE_MAP = {
+            "open_file_manager": ("open", "/"),
+            "open_terminal": ("open", "terminal"),
+            "open_calculator": ("open", "calc"),
+            "open_settings": ("open", "settings"),
+            "open_recycle_bin": ("open", "trash"),
+            "open_documents": ("open", f"/home/{self.username}/Documents"),
+            "open_desktop": ("open", f"/home/{self.username}/Desktop"),
+            "open_ai_assistant": ("open", "ai"),
+            "open_task_manager": ("open", "taskmgr"),
+            "open_system_monitor": ("open", "sysmon"),
+            "open_workspace": ("open", "workspace"),
+            "open_app_store": ("open", "store"),
+            "open_paint": ("open", "paint"),
+            "empty_trash": ("empty_trash", None),
+            "list_dir": ("list_dir", None),
+            "whoami": ("execute", "whoami"),
+            "reboot": ("execute", "reboot"),
+            "shutdown": ("execute", "shutdown"),
+            "show_time": ("execute", "time"),
+            "show_date": ("execute", "date"),
+            "system_info": ("execute", "uname -a"),
+            "memory_info": ("execute", "mem"),
+            "disk_info": ("execute", "df"),
+            "list_users": ("execute", "users"),
+            "process_list": ("execute", "ps"),
+        }
+
         matches = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text)
         for match in matches:
             try:
                 data = json.loads(match)
-                tool = data.get("tool")
+                tool = data.get("tool", "").strip()
                 args = data.get("args", {})
-                if tool == "open_file_manager":
-                    actions.append(("open", "/"))
-                elif tool == "open_terminal":
-                    actions.append(("open", "terminal"))
-                elif tool == "open_browser":
-                    actions.append(("open", "browser"))
-                elif tool == "open_recycle_bin":
-                    actions.append(("open", f"/home/{self.username}/.trash"))
-                elif tool == "open_documents":
-                    actions.append(("open", f"/home/{self.username}/Documents"))
-                elif tool == "open_ai_assistant":
-                    actions.append(("open", "ai"))
+
+                if tool in SIMPLE_MAP:
+                    actions.append(SIMPLE_MAP[tool])
+                    continue
+
+                if tool == "open_browser":
+                    actions.append(("open", args.get("url", "browser")))
+                elif tool == "open_editor":
+                    actions.append(("open", args.get("path", "editor")))
                 elif tool == "new_folder":
-                    actions.append(("new_folder", args.get("folder_name", "新文件夹")))
+                    actions.append(("new_folder", args.get("path", "新文件夹")))
                 elif tool == "new_file":
-                    actions.append(("new_file", args.get("file_path", "new.txt"), args.get("content", "")))
+                    actions.append(("new_file", args.get("path", "new.txt"), args.get("content", "")))
                 elif tool == "write_file":
-                    actions.append(("write_file", args.get("file_path", "new.txt"), args.get("content", "")))
-                elif tool == "rename":
-                    actions.append(("rename", args.get("old_path", ""), args.get("new_name", "")))
+                    actions.append(("write_file", args.get("path", ""), args.get("content", "")))
+                elif tool == "read_file":
+                    actions.append(("read_file", args.get("path", "")))
                 elif tool == "delete":
                     actions.append(("delete", args.get("path", "")))
-                elif tool == "empty_trash":
-                    actions.append(("empty_trash", None))
+                elif tool == "permanent_delete":
+                    actions.append(("permanent_delete", args.get("path", "")))
+                elif tool == "rename":
+                    actions.append(("rename", args.get("old_path", ""), args.get("new_name", "")))
                 elif tool == "move":
                     actions.append(("move", args.get("src", ""), args.get("dst", "")))
                 elif tool == "copy":
                     actions.append(("copy", args.get("src", ""), args.get("dst", "")))
                 elif tool == "cd":
                     actions.append(("cd", args.get("path", "/")))
-                elif tool == "list_dir":
-                    actions.append(("list_dir", None))
-                elif tool == "execute_command":
-                    actions.append(("execute", args.get("command", "dir")))
-                elif tool == "read_file":
-                    actions.append(("read_file", args.get("path", "")))
                 elif tool == "search_file":
                     actions.append(("search_file", args.get("keyword", "")))
+                elif tool == "execute_command":
+                    actions.append(("execute", args.get("command", "dir")))
+                elif tool == "ping":
+                    actions.append(("execute", f"ping {args.get('host', '')}".strip()))
+                elif tool == "download":
+                    d = args.get("dest", "")
+                    actions.append(("execute", f"download {args.get('url', '')} {d}".strip()))
+                elif tool == "weather":
+                    actions.append(("execute", f"weather {args.get('city', '')}".strip()))
+                elif tool == "calc":
+                    actions.append(("execute", f"calc {args.get('expr', '')}".strip()))
+                elif tool == "get_setting":
+                    actions.append(("execute", f"settings get {args.get('key', '')}".strip()))
+                elif tool == "set_setting":
+                    actions.append(("execute", f"settings set {args.get('key', '')} {args.get('value', '')}".strip()))
+                elif tool == "change_wallpaper":
+                    actions.append(("change_wallpaper", args.get("color", "#1e1e1e")))
+                elif tool == "change_language":
+                    actions.append(("execute", f"settings set locale.language {args.get('lang', 'en')}"))
+                elif tool == "add_user":
+                    actions.append(("add_user", args.get("username", ""), args.get("password", "")))
+                elif tool == "delete_user":
+                    actions.append(("delete_user", args.get("username", "")))
+                elif tool == "change_password":
+                    actions.append(("change_password", args.get("new_password", "")))
+                elif tool == "launch_game":
+                    actions.append(("execute", args.get("game", "")))
             except Exception:
                 continue
         return actions
 
-    # ---------- 模型请求 ----------
+    # ==================== 模型请求 ====================
     def _query_ollama(self, model, messages):
         try:
             import requests
@@ -13227,14 +14700,35 @@ class UnifiedAIEngine:
                 "messages": [{"role": "system", "content": self.system_prompt}] + messages,
                 "stream": False,
             }
-            r = requests.post("http://localhost:11434/api/chat", json=payload, timeout=300)
-            if r.status_code == 200:
-                return r.json().get("message", {}).get("content", "（空回复）")
-            else:
+
+            # 用 stream=True 手工收，可以边等边打点
+            import time as _t
+            t0 = _t.time()
+            r = requests.post(
+                "http://localhost:11434/api/chat",
+                json=payload,
+                timeout=(10, 900),
+                stream=True,
+            )
+            if r.status_code != 200:
                 return f"Ollama 返回错误: {r.status_code}"
+
+            chunks = []
+            last_tick = t0
+            for line in r.iter_lines(decode_unicode=True):
+                if line:
+                    chunks.append(line)
+                now = _t.time()
+                if now - last_tick >= 5:
+                    # ★ 走 _log_progress，按当前对话目标分发
+                    self._log_progress(f"⏳ AI 思考中...（已等待 {int(now-t0)} 秒）")
+                    last_tick = now
+
+            data = json.loads("".join(chunks))
+            return data.get("message", {}).get("content", "（空回复）")
         except ImportError:
-            import urllib.request
             import socket
+            import urllib.request
             payload = {
                 "model": model,
                 "messages": [{"role": "system", "content": self.system_prompt}] + messages,
@@ -13257,25 +14751,103 @@ class UnifiedAIEngine:
                 socket.setdefaulttimeout(old_timeout)
 
     def _query_litellm(self, provider, model, messages):
-        if not HAS_LITELLM:
-            raise RuntimeError("LiteLLM 未安装")
-        response = completion(
-            model=f"{provider}/{model}",
-            messages=[{"role": "system", "content": self.system_prompt}] + messages,
-            api_key=os.environ.get(f"{provider.upper()}_API_KEY"),
-            timeout=300,
-        )
-        return response["choices"][0]["message"]["content"]
+        """
+        直连 OpenAI 兼容 API（/v1/chat/completions）。
+        不依赖 LiteLLM，只需 requests。
+        配置来源：
+          ai.base_url  例如 https://api.deepseek.com/v1
+          ai.api_key   你的 key
+          ai.model     模型名，例如 deepseek-chat
+        返回：模型回复字符串。
+        """
+        import requests
 
-    # ---------- 多代理处理 ----------
+        # ---------- 1. 读配置 ----------
+        base_url = (self.shell.config.get("ai.base_url", "") or "").strip()
+        api_key = (self.shell.config.get("ai.api_key", "") or "").strip()
+        model_name = (self.shell.config.get("ai.model", "") or "").strip() or model
+
+        if not base_url:
+            return "❌ 在线 AI 未配置 base_url（ai.base_url）"
+        if not api_key:
+            return "❌ 在线 AI 未配置 api_key（ai.api_key）"
+
+        # ---------- 2. 拼接 endpoint ----------
+        # 容忍用户填 https://api.x.com 或 https://api.x.com/v1 或 .../v1/chat/completions
+        url = base_url.rstrip("/")
+        if not url.endswith("/chat/completions"):
+            if not url.endswith("/v1"):
+                url += "/v1"
+            url += "/chat/completions"
+
+        # ---------- 3. 请求体 ----------
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": self.system_prompt}
+            ] + [m for m in messages if m.get("role") != "system"],
+            "stream": False,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # ---------- 4. 发请求 ----------
+        try:
+            r = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=(10, 300),   # 连接 10s，读取 300s
+            )
+        except requests.exceptions.ConnectTimeout:
+            return f"❌ 连接超时：无法访问 {url}"
+        except requests.exceptions.ConnectionError as e:
+            return f"❌ 网络错误：{e}"
+        except requests.exceptions.Timeout:
+            return "❌ 在线 AI 推理超时（>300 秒）"
+        except Exception as e:
+            return f"❌ 请求异常：{e}"
+
+        # ---------- 5. 解析响应 ----------
+        if r.status_code != 200:
+            # 尽量提取服务端返回的错误信息
+            err_msg = r.text[:500] if r.text else "(无响应体)"
+            return f"❌ HTTP {r.status_code}: {err_msg}"
+
+        try:
+            data = r.json()
+        except Exception as e:
+            return f"❌ 响应不是合法 JSON: {e} | body={r.text[:300]}"
+
+        # 标准 OpenAI 格式
+        try:
+            content = data["choices"][0]["message"]["content"]
+            if content:
+                return content
+        except (KeyError, IndexError, TypeError):
+            pass
+
+        # 有些服务商出错时返回 {"error": {...}}
+        if "error" in data:
+            err = data["error"]
+            if isinstance(err, dict):
+                return f"❌ API 错误: {err.get('message', str(err))}"
+            return f"❌ API 错误: {err}"
+
+        return f"❌ 无法解析响应: {str(data)[:300]}"
+
+    # ==================== 多代理 ====================
     def _handle_multi_agent(self, user_text):
+        """返回 (reply, emoji)，由调用者决定输出目标。"""
         question = user_text.replace("多代理:", "").replace("multi:", "").strip()
         if not self._quick_check_ollama():
-            self._emit_reply("本地 Ollama 未运行，无法执行多代理任务。", "❌")
-            return
+            return "本地 Ollama 未运行，无法执行多代理任务。", "❌"
         reply = self.shell._run_multi_agent_workflow(question)
         self.messages.append({"role": "assistant", "content": reply})
-        self._emit_reply(reply, "🤖")
+        return reply, "🤖"
 
     def handle_multi_agent_sync(self, user_text):
         question = user_text.replace("多代理:", "").replace("multi:", "").strip()
@@ -13295,7 +14867,7 @@ class UnifiedAIEngine:
                 continue
         return False
 
-    # ---------- 语音合成 ----------
+    # ==================== 语音合成 ====================
     def speak(self, text):
         if not HAS_EDGE_TTS or not HAS_PYGAME:
             return
@@ -13304,8 +14876,8 @@ class UnifiedAIEngine:
 
     async def _async_speak(self, text):
         import tempfile
-        import pygame
         import edge_tts
+        import pygame
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         tmp_path = tmp.name
         tmp.close()
@@ -13319,7 +14891,7 @@ class UnifiedAIEngine:
             pygame.mixer.music.load(tmp_path)
             pygame.mixer.music.play()
             while pygame.mixer.music.get_busy():
-                time.sleep(0.1)
+                await asyncio.sleep(0.1)
         except Exception as e:
             print(f"语音合成失败: {e}")
         finally:
@@ -13331,7 +14903,7 @@ class UnifiedAIEngine:
     def clear_history(self):
         self.messages = []
 
-    # ---------- 完整离线回复引擎 ----------
+    # ==================== 离线回复引擎（完整） ====================
     def _offline_reply(self, text):
         import datetime
         import difflib
@@ -13984,6 +15556,7 @@ class UnifiedAIEngine:
                 if hasattr(self.shell, "gui_app") and self.shell.gui_app:
                     def show_reminder():
                         try:
+                            from tkinter import messagebox
                             messagebox.showinfo("⏰ 倒计时提醒", f"⌛ 时间到！\n\n{msg}")
                         except Exception:
                             pass
@@ -14016,6 +15589,7 @@ class UnifiedAIEngine:
                     "• 系统控制：打开终端、关机、重启\n"
                     "• 文件管理：打开目录、删除文件、新建文件夹\n"
                     "• 读取文件：读取 readme.txt\n"
+                    "• 用户管理：新增用户、删除用户、改密码\n"
                     "• 翻译词典：苹果英文、翻译苹果\n"
                     "• 单位换算：1米等于多少厘米\n"
                     "• 温度转换：37摄氏等于多少华氏\n"
@@ -14308,8 +15882,12 @@ class KIKIShell:
         self.max_history = 20
         self._load_env()
         self._ai_msgs = []
+        # ★ 关键修复：model_registry 必须早于 _apply_ai 创建
+        # 因为 _apply_ai 里会通过 self.model_registry 自动选择文本模型
+        self.model_registry = ModelRegistry(self)
         self._apply_ai()
         self.chat = ChatManager(shell=self)
+        self._fuck_instance = Fuck()
         self.ai_engine = UnifiedAIEngine(self)
         self._ai_output_target = "terminal"   # "terminal" 或 "chat"
         self._ai_chat_callback = None         # AI 窗口的回调
@@ -14406,7 +15984,100 @@ class KIKIShell:
         self.ai_worker.start()
         # ====================================
 
+    @command("fuck", "misc", "20 个无意义方法（娱乐命令）")
+    def fuck_cmd(self, args, src=None):
+        """fuck <1-20> | fuck list | fuck all"""
+        if not hasattr(self, "_fuck_instance") or self._fuck_instance is None:
+            self._fuck_instance = Fuck()
 
+        arg = (args or "").strip().lower()
+
+        if not arg or arg in ("help", "-h", "--help"):
+            print("用法:")
+            print("  fuck <1-20>   执行指定编号的无意义方法")
+            print("  fuck list     列出所有方法及说明")
+            print("  fuck all      依次执行全部 20 个")
+            return
+
+        if arg == "list":
+            print("=" * 60)
+            print("Fuck 类无意义方法列表")
+            print("=" * 60)
+            for i in range(1, 21):
+                method = getattr(self._fuck_instance, f"fuck_{i:02d}", None)
+                doc = (method.__doc__ or "无描述").strip() if method else "不存在"
+                print(f"  fuck_{i:02d} - {doc}")
+            return
+
+        if arg == "all":
+            print("=" * 60)
+            print("开始依次执行 fuck_01 ~ fuck_20 ...")
+            print("=" * 60)
+            for i in range(1, 21):
+                method = getattr(self._fuck_instance, f"fuck_{i:02d}", None)
+                if method is None:
+                    continue
+                try:
+                    method()
+                except Exception as e:
+                    print(f"  ⚠️ fuck_{i:02d} 抛出异常: {e}")
+            print("=" * 60)
+            print("全部执行完毕，恭喜你浪费了人生中的 20 秒钟。")
+            print("=" * 60)
+            return
+
+        # 单个编号
+        try:
+            num = int(arg)
+        except ValueError:
+            print(f"无法识别的参数: {arg!r}")
+            print("用法: fuck <1-20> | fuck list | fuck all")
+            return
+
+        if not (1 <= num <= 20):
+            print(f"编号超出范围（1-20）: {num}")
+            return
+
+        method = getattr(self._fuck_instance, f"fuck_{num:02d}", None)
+        if method is None:
+            print(f"fuck_{num:02d} 不存在")
+            return
+
+        try:
+            ret = method()
+            if ret is not None:
+                print(f"→ 返回值: {ret!r}")
+        except Exception as e:
+            print(f"⚠️ fuck_{num:02d} 抛出异常: {e}")
+            print("  （别慌，这是正常的，fuck_04 就是故意抛异常的）")
+
+    def _split_redirect_safe(self, cmd_line):
+        """
+        在尊重引号的前提下，分离命令和重定向目标。
+        返回 (cmd, redirect_mode, redirect_file)
+        redirect_mode 为 None / '>' / '>>'
+        """
+        in_single = False
+        in_double = False
+        i = 0
+        n = len(cmd_line)
+        while i < n:
+            ch = cmd_line[i]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif ch == ">" and not in_single and not in_double:
+                if i + 1 < n and cmd_line[i + 1] == ">":
+                    cmd = cmd_line[:i].rstrip()
+                    rest = cmd_line[i + 2:].strip()
+                    return cmd, ">>", rest.strip("\"'")
+                else:
+                    cmd = cmd_line[:i].rstrip()
+                    rest = cmd_line[i + 1:].strip()
+                    return cmd, ">", rest.strip("\"'")
+            i += 1
+        return cmd_line, None, None
 
     def shutdown(self):
         """关闭所有子进程并清理资源"""
@@ -14721,42 +16392,73 @@ class KIKIShell:
             return None
 
     def _safe_exec_python(self, code, file_path=None):
+        """在沙盒子进程中执行 Python 代码。
+        ★ 不阻塞主线程：用后台线程等子进程，主线程只负责输出。
+        """
         import multiprocessing
+        import threading
 
         output_queue = multiprocessing.Queue()
         p = multiprocessing.Process(
-            target=_safe_exec_sandbox_target, args=(code, output_queue, file_path)
+            target=_safe_exec_sandbox_target,
+            args=(code, output_queue, file_path),
+            daemon=True,
         )
         p.start()
-        p.join(timeout=60)
 
-        output = ""
-        error = ""
-        if not output_queue.empty():
-            msg = output_queue.get()
-            if msg[0] == "result":
-                output = msg[1]
-                error = msg[2]
-            elif msg[0] == "exception":
-                error = msg[1]
+        def wait_worker():
+            p.join(timeout=60)
 
-        if p.is_alive():
-            p.terminate()
-            p.join()
-            error += "\n⚠️ 沙盒执行超时，已被强制终止。"
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
+                if p.is_alive():
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                output = ""
+                error = "⚠️ 沙盒执行超时（60秒），已被强制终止。"
+            else:
+                output = ""
+                error = ""
+                try:
+                    msg = output_queue.get_nowait()
+                    if msg[0] == "result":
+                        output = msg[1]
+                        error = msg[2]
+                    elif msg[0] == "exception":
+                        error = msg[1]
+                except Exception:
+                    pass
 
-        if hasattr(self, "gui_app") and self.gui_app:
-            if output:
-                self.gui_app._print(output)
-            if error:
-                self.gui_app._print(error)
-            self.gui_app.event_generate("<<CommandDone>>")
-        else:
-            if output:
-                print(output, end="")
-            if error:
-                print(error, end="")
-            self._print_prompt()
+            # 回主线程更新 UI
+            def update_ui():
+                if hasattr(self, "gui_app") and self.gui_app and self.gui_app.winfo_exists():
+                    if output:
+                        self.gui_app._print(output)
+                    if error:
+                        self.gui_app._print(error)
+                    self.gui_app.event_generate("<<CommandDone>>")
+                else:
+                    if output:
+                        print(output, end="")
+                    if error:
+                        print(error, end="")
+                    self._print_prompt()
+
+            try:
+                if hasattr(self, "gui_app") and self.gui_app and self.gui_app.winfo_exists():
+                    self.gui_app.after(0, update_ui)
+                else:
+                    update_ui()
+            except Exception:
+                try:
+                    update_ui()
+                except Exception:
+                    pass
+
+        threading.Thread(target=wait_worker, daemon=True).start()
 
     def _safe_eval_expression(self, expr):
         """安全求值单行 Python 表达式（只允许纯运算和打印，阻断模块导入）"""
@@ -15115,7 +16817,9 @@ class KIKIShell:
             print(disclaimer_text)
             print("=" * 70)
             try:
-                input("⚠️ 请确认你已阅读并理解了上述风险，按 Enter 键继续热修复...")
+                if not self._ask_user("⚠️ 热修复确认", disclaimer_text, mode="confirm"):
+                    print("热修复已取消")
+                    return
             except KeyboardInterrupt:
                 print("\n热修复已取消")
                 return
@@ -15338,7 +17042,6 @@ class KIKIShell:
                     target = os.path.abspath(os.path.join(cwd, parts[1]))
                     if os.path.isdir(target):
                         cwd = target
-                        os.chdir(cwd)
                     else:
                         print("Directory not found")
 
@@ -15396,6 +17099,36 @@ Commands:
 
             except Exception as e:
                 print(f"Error: {e}")
+
+    def _ask_user(self, title, prompt, mode="yesno"):
+        """跨环境询问用户。GUI 用弹窗，终端用 input()。
+        mode: "yesno" → 返回 True/False
+              "string" → 返回字符串或 None
+              "choice" → 返回用户输入的字符串（用于 l/r/m 之类）
+        """
+        if hasattr(self, "gui_app") and self.gui_app and self.gui_app.winfo_exists():
+            try:
+                if mode == "yesno":
+                    return messagebox.askyesno(title, prompt, parent=self.gui_app)
+                elif mode == "confirm":   # ★ 新增：单按钮确认
+                    return messagebox.askokcancel(title, prompt, parent=self.gui_app)
+                elif mode == "string":
+                    return simpledialog.askstring(title, prompt, parent=self.gui_app)
+                elif mode == "choice":
+                    return simpledialog.askstring(title, prompt, parent=self.gui_app)
+            except Exception as e:
+                logging.error(f"弹窗失败，回退终端: {e}")
+        # 终端模式（或 GUI 弹窗失败）
+        try:
+            if mode == "yesno":
+                ans = input(prompt + " (y/n): ").strip().lower()
+                return ans == "y"
+            else:
+                return input(prompt)
+        except EOFError:
+            return False if mode == "yesno" else None
+        except KeyboardInterrupt:
+            return False if mode == "yesno" else None
 
     @command("storegui", "system", "打开图形化应用商店")
     def storegui_cmd(self, args, src=None):
@@ -15477,24 +17210,129 @@ Commands:
         if not self.voice:
             print("语音识别库未安装")
             return
-        text = self.voice.listen()
-        if text:
+        if not getattr(self.voice, "available", False):
+            print("❌ 未检测到麦克风，语音功能不可用")
+            return
+
+        # ===== 第一步：在主线程里决定 AI 模型（会弹窗）=====
+        if (hasattr(self, "ai_engine") and self.ai_engine
+                and self.ai_engine._model_user_choice is None):
+            def _ask_model():
+                try:
+                    self.ai_engine._try_enable_model_sync()
+                except Exception as e:
+                    print(f"[语音] 启用在线模型失败: {e}")
+            self._run_in_main_thread(_ask_model, timeout=120)
+
+        # ===== 第二步：后台线程里录音（会阻塞，不能主线程做）=====
+        import threading
+
+        def work():
+            try:
+                text = self.voice.listen()
+            except Exception as e:
+                print(f"[语音] listen 异常: {e}")
+                text = None
+
+            # ===== 第三步：识别失败 → 主线程弹输入框 =====
+            if not text:
+                def _ask_input():
+                    from tkinter import simpledialog
+                    try:
+                        self.gui_app.lift()
+                        self.gui_app.focus_force()
+                    except Exception:
+                        pass
+                    try:
+                        return simpledialog.askstring(
+                            "语音识别失败",
+                            "未识别到有效语音（可能网络异常或麦克风问题）。\n"
+                            "请手动输入您的指令：",
+                            parent=self.gui_app,
+                        )
+                    except Exception as e:
+                        print(f"[语音] 弹窗失败: {e}")
+                        return None
+                text = self._run_in_main_thread(_ask_input, timeout=120)
+
+            if not text:
+                print("已取消")
+                return
+
             print(f"执行: {text}")
-            self.voice.execute(text)
+            try:
+                self.voice.execute(text)
+            except Exception as e:
+                print(f"[语音] 执行失败: {e}")
+                import traceback
+                traceback.print_exc()
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _run_in_main_thread(self, func, timeout=60):
+        """
+        把 func 调度到主线程执行，等待结果返回。
+        - 已在主线程：直接执行
+        - 后台线程：用 gui_app.after(0) 调度到主线程，用 Queue 收结果
+        返回 func 的返回值；超时或异常返回 None。
+        """
+        import queue
+        import threading
+
+        # 没有 GUI 环境，直接调用
+        if not (hasattr(self, "gui_app") and self.gui_app and self.gui_app.winfo_exists()):
+            try:
+                return func()
+            except Exception as e:
+                print(f"[调度] 执行失败: {e}")
+                return None
+
+        # 已在主线程：直接执行
+        if threading.current_thread() is threading.main_thread():
+            try:
+                return func()
+            except Exception as e:
+                print(f"[调度] 执行失败: {e}")
+                return None
+
+        # 后台线程：调度到主线程
+        result_q = queue.Queue()
+        done_flag = threading.Event()
+
+        def wrapper():
+            try:
+                r = func()
+            except Exception as e:
+                print(f"[调度] 主线程执行失败: {e}")
+                r = None
+            result_q.put(r)
+            done_flag.set()
+
+        try:
+            self.gui_app.after(0, wrapper)
+        except Exception as e:
+            print(f"[调度] after 失败: {e}")
+            return None
+
+        if done_flag.wait(timeout=timeout):
+            try:
+                return result_q.get_nowait()
+            except Exception:
+                return None
+        print(f"[调度] 超时（{timeout}秒）")
+        return None
 
     @command("download", "net", "从网络下载文件到 VFS")
     def download_cmd(self, args, src=None):
         """download <URL> [目标路径] - 下载文件到 VFS（支持批量写入、原子替换）"""
         # 只要打开GUI窗口，就先尝试创建目标目录路径
         if hasattr(self, "gui_app") and self.gui_app:
-            parts = args.split()
-            if len(parts) >= 2:
-                dest_path = self.fs._resolve(parts[1])
-                parent_dir = os.path.dirname(dest_path)
-                if not self.fs.resolve(parent_dir, self.username):
-                    self.fs.mkdir(
-                        parent_dir, self.username
-                    )  # KIKI OS原生mkdir只能建单层，不过没关系，能建一层是一层
+            parts_tmp = args.split()
+            if len(parts_tmp) >= 2:
+                dest_path_tmp = self.fs._resolve(parts_tmp[1])
+                parent_dir_tmp = os.path.dirname(dest_path_tmp)
+                if not self.fs.resolve(parent_dir_tmp, self.username):
+                    self.fs.mkdir(parent_dir_tmp, self.username)
         if not HAS_REQUESTS:
             print("❌ requests 库未安装，请运行: pip install requests")
             return
@@ -15520,31 +17358,34 @@ Commands:
             return
         parent_dir = os.path.dirname(dest_path)
 
-        # ===== 👇 新增自动创建目录功能 👇 =====
-        # 检查父目录
+        # ===== 自动创建目录 =====
         if not self.fs.resolve(parent_dir, self.username):
             print(f"📂 检测到目标目录 '{parent_dir}' 不存在，正在尝试自动创建...")
-            # 因为 KIKI OS 的 mkdir 不支持一次性递归创建，我们手动一段一段地建
-            parts = parent_dir.split("/")
+            segments = parent_dir.split("/")
             current_path = ""
-            for part in parts:
-                if not part:
+            for seg in segments:
+                if not seg:
                     continue
-                current_path += "/" + part
+                current_path += "/" + seg
                 if not self.fs.resolve(current_path, self.username):
                     if not self.fs.mkdir(current_path, self.username):
                         print(f"❌ 创建目录 '{current_path}' 失败，请检查权限！")
                         return
             print("✅ 目录创建成功！")
-        # ===== 👆 新增逻辑结束 👆 =====
+        # ===== 自动创建目录结束 =====
 
         # 检查是否已存在
         if self.fs.resolve(dest_path, self.username) is not None:
             if hasattr(self, "gui_app") and self.gui_app:
-                overwrite = messagebox.askyesno("文件已存在", f"'{dest_path}' 已存在，是否覆盖？")
+                overwrite = messagebox.askyesno(
+                    "文件已存在", f"'{dest_path}' 已存在，是否覆盖？", parent=self.gui_app
+                )
             else:
                 print(f"⚠️ 文件 '{dest_path}' 已存在")
-                overwrite = input("是否覆盖？(y/n): ").strip().lower() == "y"
+                try:
+                    overwrite = input("是否覆盖？(y/n): ").strip().lower() == "y"
+                except EOFError:
+                    overwrite = False
             if not overwrite:
                 print("下载取消")
                 return
@@ -15555,7 +17396,6 @@ Commands:
         temp_path = dest_path + ".tmp"
 
         try:
-            # 超时设置 (连接 5s, 读取 60s)
             timeout = (5, 60)
             response = requests.get(url, stream=True, timeout=timeout)
             response.raise_for_status()
@@ -15563,32 +17403,27 @@ Commands:
             total_size = int(response.headers.get("content-length", 0))
             block_size = 8192
 
-            # 创建临时文件（空文件）
             if not self.fs.create_file(temp_path, "", self.username):
                 print("❌ 无法创建临时文件")
                 return
 
             downloaded = 0
             buffer = bytearray()
-            buffer_limit = 1024 * 1024  # 1MB
+            buffer_limit = 1024 * 1024
 
             def flush_buffer():
                 nonlocal buffer
                 if not buffer:
                     return
-                # 只在写入时加锁
                 with self.fs._fs_lock:
                     node = self.fs.resolve(temp_path, self.username)
                     if node and isinstance(node, File):
                         node.append(bytes(buffer))
-                        # 清理缓存，防止读到旧数据
                         self.fs._node_cache.clear()
                 buffer.clear()
 
-            # 进度显示
             if TQDM_AVAILABLE:
                 from tqdm import tqdm
-
                 pbar = tqdm(total=total_size, unit="B", unit_scale=True, desc="下载中")
             else:
                 print(f"文件大小: {total_size} 字节")
@@ -15604,26 +17439,19 @@ Commands:
                     else:
                         if downloaded % (block_size * 10) == 0:
                             percent = (downloaded / total_size * 100) if total_size else 0
-                            print(
-                                f"\r进度: {downloaded} / {total_size} 字节 ({percent:.1f}%)",
-                                end="",
-                            )
+                            print(f"\r进度: {downloaded} / {total_size} 字节 ({percent:.1f}%)", end="")
 
-            # 最后刷新缓冲区
             flush_buffer()
 
             if TQDM_AVAILABLE:
                 pbar.close()
             else:
-                print()  # 换行
+                print()
 
-            # 原子替换：移动临时文件到目标位置
             with self.fs._fs_lock:
                 if self.fs.resolve(dest_path, self.username) is not None:
                     self.fs.delete(dest_path, self.username, permanent=True)
-                # 尝试移动
                 if not self.fs.move(temp_path, dest_path, self.username):
-                    # 若移动失败（跨挂载点问题），则复制内容并删除临时文件
                     content = self.fs.read_file(temp_path, self.username)
                     if content is not None:
                         self.fs.create_file(dest_path, content, self.username)
@@ -15650,13 +17478,48 @@ Commands:
         if temp_path and self.fs.resolve(temp_path, self.username):
             self.fs.delete(temp_path, self.username, permanent=True)
 
-    @command("browser", "gui", "打开浏览器")
+    @command("models", "system", "列出所有本地 AI 模型及自动选择结果")
+    def models_cmd(self, args, src=None):
+        """models [refresh] - 显示模型清单"""
+        if args.strip().lower() == "refresh":
+            self.model_registry._fetch_models(force=True)
+            self._apply_ai()
+            print("✅ 已刷新模型缓存")
+        print(self.model_registry.report())
+
+    @command("browser", "gui", "打开浏览器 / 检查引擎状态")
     def browser_cmd(self, args):
-        """browser [url] - 打开浏览器"""
+        sub = args.strip().lower()
+        if sub == "status":
+            # 直接输出（GUI 下会自动进终端）
+            print(browser_engine_status())
+            return
+        if sub == "diagnose":
+            print("=== 浏览器引擎完整诊断 ===\n")
+            print(browser_engine_status())
+            print("\n=== 详细依赖 ===\n")
+            print(f"Python 版本: {sys.version}")
+            print(f"平台: {sys.platform}")
+            try:
+                import PyQt5
+                print(f"PyQt5: {PyQt5.__file__}")
+            except ImportError:
+                print("PyQt5: 未安装")
+            try:
+                import PyQt5.QtWebEngineWidgets
+                print("QtWebEngineWidgets: ✅")
+            except ImportError as e:
+                print(f"QtWebEngineWidgets: ❌ {e}")
+            try:
+                import tkinterweb
+                print(f"tkinterweb: {tkinterweb.__file__}")
+            except ImportError:
+                print("tkinterweb: 未安装")
+            return
+
         if hasattr(self, "gui_app") and self.gui_app:
             url = args.strip() if args.strip() else "https://www.bilibili.com"
-            win = QtTabBrowserWindow(self.gui_app, url)
-            self.gui_app._add_window(win)
+            self.gui_app._open_browser(url)
         else:
             print("浏览器仅 GUI 模式可用")
 
@@ -16838,7 +18701,7 @@ def register(api):
 
     @command("ver", "system", "cmd_ver")
     def ver(self, args, src=None):
-        print(f"KIKI OS v7.0\nCPU: {self.hw.cpu}\nRAM: {self.hw.ram_mb} MB\nKernel: 5.15.0")
+        print(f"KIKI OS v{KIKI_VERSION}\nCPU: {self.hw.cpu}\nRAM: {self.hw.ram_mb} MB\nKernel: 5.15.0")
 
     @command("date", "system", "cmd_date")
     def date(self, args, src=None):
@@ -17348,13 +19211,46 @@ def register(api):
                 self.fs.cwd = temp
             else:
                 self.fs.cwd = self.fs.root
-        self.gui_app.username = target
-        self.gui_app._update_status()
-        self.gui_app._refresh_all_file_managers(f"/home/{target}")
-        self.gui_app._create_desktop_icons()
+        # ★ 先清缓存
+        self.fs._node_cache.clear()
+        self.fs._perm_cache.clear()
+
+        # ★ 加载新用户配置
         self.config.load_user_config(target)
         self.apply_config()
         self._load_user_env()
+
+        # ★ 同步更新 GUI
+        self.gui_app.username = target
+        self.gui_app._update_status()
+
+        # ★ 重载固定项 / 挂件 / 壁纸
+        try:
+            self.gui_app._load_pinned_items()
+        except Exception:
+            pass
+        try:
+            if hasattr(self.gui_app, "_load_widgets"):
+                self.gui_app._load_widgets()
+        except Exception:
+            pass
+        try:
+            self.gui_app._update_wallpaper()
+        except Exception:
+            pass
+
+        # ★ 刷新文件管理器
+        self.gui_app._refresh_all_file_managers(f"/home/{target}")
+
+        # ★ 重建桌面图标（最后做）
+        self.gui_app._create_desktop_icons()
+
+        # ★ 刷新 Dock
+        try:
+            self.gui_app._update_dock()
+        except Exception:
+            pass
+
         self.fs._audit(f"SU {target}", self.username)
         print(_("switched_user", target))
         self.gui_app._do_print_prompt()
@@ -17676,11 +19572,11 @@ def register(api):
     def uname_cmd(self, args, src=None):
         if args.strip() == "-a":
             print(
-                f"KIKI OS {self.hostname} 5.15.0 x86_64\nHardware: {self.hw.cpu}\nArchitecture: x86_64"
+                f"KIKI OS {KIKI_VERSION} {self.hostname} 5.15.0 x86_64\nHardware: {self.hw.cpu}\nArchitecture: x86_64"
             )
         else:
             print(
-                f"KIKI OS\nHostname: {self.hostname}\nKernel: 5.15.0\nHardware: {self.hw.cpu}\nArchitecture: x86_64"
+                f"KIKI OS {KIKI_VERSION}\nHostname: {self.hostname}\nKernel: 5.15.0\nHardware: {self.hw.cpu}\nArchitecture: x86_64"
             )
 
     @command("uptime", "system", "cmd_uptime")
@@ -19223,43 +21119,119 @@ def register(api):
 
     @command("basic", "program", "cmd_basic")
     def basic_cmd(self, args, src=None):
+        """BASIC 解释器：basic <file.bas>"""
         if not args:
             print("Usage: basic <filename.bas>")
             return
+
         content = self.fs.read_file(args, self.username)
         if content is None:
             print(_("basic_file_not_found", args))
             return
+
+        # ---------- 1. 解析行号 ----------
         program = {}
-        for line in content.splitlines():
-            line = line.strip()
+        for lineno_str, raw in enumerate(content.splitlines(), 1):
+            line = raw.strip()
             if not line:
+                continue
+            if line.upper().startswith("REM ") or line.startswith("'"):
                 continue
             parts = line.split(maxsplit=1)
             if not parts[0].isdigit():
-                print(_("basic_syntax_error", "missing line number"))
+                print(_("basic_syntax_error", f"第 {lineno_str} 行缺少行号: {line}"))
                 return
-            program[int(parts[0])] = parts[1] if len(parts) > 1 else ""
+            program[int(parts[0])] = parts[1].strip() if len(parts) > 1 else ""
+
         if not program:
             print(_("basic_no_lines"))
             return
-        vars = {}
+
+        # ---------- 2. 运行时状态 ----------
+        variables = {}
+
+        def is_valid_var(name):
+            """合法变量名：字母开头，可含字母/数字/下划线，可选 $ 结尾"""
+            return bool(re.match(r"^[A-Za-z][A-Za-z0-9_]*\$?$", name))
+
+        def get_value(token):
+            """把操作数解析成值。"""
+            token = token.strip()
+            if not token:
+                raise NameError("空操作数")
+
+            # 纯字符串字面量（内部不含引号）
+            if re.fullmatch(r'"[^"]*"', token):
+                return token[1:-1]
+
+            # 整数字面量（支持 +/- 前缀）
+            if token.isdigit():
+                return int(token)
+            if token[0] in ("+", "-") and token[1:].isdigit():
+                return int(token)
+
+            # 变量
+            if token in variables:
+                return variables[token]
+
+            raise NameError(f"变量未定义: {token}")
 
         def eval_expr(expr):
+            """求值：字符串 / 数字 / 变量 / 数学表达式"""
             expr = expr.strip()
-            if expr.startswith('"') and expr.endswith('"'):
+            if not expr:
+                raise ValueError("空表达式")
+
+            # 纯字符串字面量（内部不含引号）
+            if re.fullmatch(r'"[^"]*"', expr):
                 return expr[1:-1]
+
+            # 单变量
+            if expr in variables:
+                return variables[expr]
+
+            # 整数字面量（支持 +/- 前缀）
             if expr.isdigit():
                 return int(expr)
-            if expr in vars:
-                return vars[expr]
+            if expr[0] in ("+", "-") and expr[1:].isdigit():
+                return int(expr)
+
+            # ★ 关键修复：标识符扫描前，先把字符串字面量抠掉
+            no_strings = re.sub(r'"[^"]*"', "", expr)
+            MATH_FUNCS = {
+                "sin", "cos", "tan", "asin", "acos", "atan",
+                "sqrt", "log", "log10", "exp", "pi", "e",
+            }
+            for ident in re.findall(r"[A-Za-z][A-Za-z0-9_]*\$?", no_strings):
+                if ident in variables or ident in MATH_FUNCS:
+                    continue
+                raise NameError(f"变量未定义: {ident}")
+
+            # 变量替换（按长度倒序，避免 a 命中 abc）
             temp = expr
-            for var in sorted(vars.keys(), key=len, reverse=True):
+            for var in sorted(variables.keys(), key=len, reverse=True):
                 if var in temp:
-                    temp = temp.replace(var, str(vars[var]))
-            if not re.match(r"^[\d\s\+\-\*\/\(\)]+$", temp):
-                raise ValueError("Invalid expression")
-            return eval(temp, {"__builtins__": {}}, {})
+                    val = variables[var]
+                    if isinstance(val, str):
+                        temp = temp.replace(var, f'"{val}"')
+                    else:
+                        temp = temp.replace(var, str(val))
+
+            # 含字符串 → 必须是 "字符串" (+ "字符串")* 的形式
+            if '"' in temp:
+                pattern = r'^\s*"[^"]*"\s*(?:\+\s*"[^"]*"\s*)*$'
+                if not re.fullmatch(pattern, temp):
+                    raise ValueError(
+                        f"字符串表达式格式错误，只允许 \"字符串\" + \"字符串\" 的形式: {expr}"
+                    )
+                str_parts = re.findall(r'"([^"]*)"', temp)
+                return "".join(str_parts)
+
+            # 纯数学表达式
+            result = self._safe_math_eval(temp)
+            if result is None:
+                raise ValueError(f"Invalid expression: {expr}")
+            return result
 
         def next_line(n):
             for k in sorted(program.keys()):
@@ -19267,29 +21239,38 @@ def register(api):
                     return k
             return None
 
+        # ---------- 3. 主循环 ----------
         ip = min(program.keys())
         stack = []
+
         while True:
             if ip not in program:
                 print(f"Runtime error: line {ip} missing")
                 break
+
             stmt = program[ip].strip()
             if not stmt:
                 ip = next_line(ip)
                 continue
-            if stmt.upper().startswith("NEXT"):
+
+            upper = stmt.upper()
+
+            # ----- NEXT -----
+            if upper.startswith("NEXT"):
                 if not stack:
                     print("Runtime error: NEXT without FOR")
                     break
                 var, start, end, step, next_ip = stack.pop()
-                vars[var] += step
-                if (step > 0 and vars[var] <= end) or (step < 0 and vars[var] >= end):
+                variables[var] += step
+                if (step > 0 and variables[var] <= end) or (step < 0 and variables[var] >= end):
                     ip = next_ip
                     stack.append((var, start, end, step, next_ip))
                 else:
                     ip = next_line(ip)
                 continue
-            if stmt.upper().startswith("PRINT"):
+
+            # ----- PRINT -----
+            if upper.startswith("PRINT"):
                 rest = stmt[5:].strip()
                 if not rest:
                     print()
@@ -19297,126 +21278,206 @@ def register(api):
                     out = []
                     for p in rest.split(";"):
                         p = p.strip()
+                        if not p:
+                            continue
                         if p.startswith('"') and p.endswith('"'):
                             out.append(p[1:-1])
                         else:
                             try:
-                                out.append(str(eval_expr(p)))
-                            except Exception:
-                                out.append(p)
-                    print(" ".join(out))
-            elif stmt.upper().startswith("INPUT"):
-                rest = stmt[5:].strip()
-                if rest:
-                    if rest.startswith('"'):
-                        endq = rest.find('"', 1)
-                        prompt = rest[1:endq]
-                        var = rest[endq + 1 :].strip().lstrip(";")
-                    else:
-                        prompt = "? "
-                        var = rest
-                    inp = self._basic_input(prompt)
-                    if inp is None:
-                        ip = next_line(ip)
-                        continue
-                    try:
-                        vars[var] = int(inp)
-                    except Exception:
-                        vars[var] = inp
+                                v = eval_expr(p)
+                                out.append(str(v))
+                            except (NameError, ValueError) as e:
+                                print(f"Runtime error at line {ip}: {e}")
+                                out = None
+                                break
+                    if out is not None:
+                        print(" ".join(out))
+
+            # ----- INPUT -----
+            elif upper.startswith("INPUT"):
+                is_string_input = upper.startswith("INPUT$")
+                offset = 6 if is_string_input else 5
+                rest = stmt[offset:].strip()
+
+                if not rest:
+                    print(f"Runtime error at line {ip}: INPUT 缺少变量名")
+                    break
+
+                if rest.startswith('"'):
+                    endq = rest.find('"', 1)
+                    if endq == -1:
+                        print(f"Runtime error at line {ip}: INPUT 提示字符串未闭合")
+                        break
+                    prompt = rest[1:endq]
+                    var = rest[endq + 1:].strip().lstrip(";").strip()
                 else:
-                    var = self._basic_input("? ")
-                    if var is None:
-                        ip = next_line(ip)
-                        continue
-                    inp = self._basic_input("? ")
-                    if inp is None:
-                        ip = next_line(ip)
-                        continue
+                    prompt = "? "
+                    var = rest.strip()
+
+                if not var:
+                    print(f"Runtime error at line {ip}: INPUT 缺少变量名")
+                    break
+                if not is_valid_var(var):
+                    print(f"Runtime error at line {ip}: 非法变量名 {var}")
+                    break
+
+                inp = self._basic_input(prompt)
+                if inp is None:
+                    ip = next_line(ip)
+                    continue
+                if is_string_input or var.endswith("$"):
+                    variables[var] = str(inp)
+                else:
                     try:
-                        vars[var] = int(inp)
-                    except Exception:
-                        vars[var] = inp
-            elif stmt.upper().startswith("LET"):
-                rest = stmt[3:].strip()
+                        variables[var] = int(inp)
+                    except (ValueError, TypeError):
+                        variables[var] = str(inp)
+
+            # ----- LET / 直接赋值 -----
+            elif upper.startswith("LET"):
+                rest = stmt[3:].strip() if upper.startswith("LET ") else stmt
                 if "=" not in rest:
                     print(f"Syntax error: LET {rest}")
                     break
                 var, expr = rest.split("=", 1)
                 var = var.strip()
-                if not var.isalpha():
-                    print(f"Invalid variable {var}")
+                if not is_valid_var(var):
+                    print(f"Runtime error at line {ip}: 非法变量名 {var}")
                     break
                 try:
-                    vars[var] = eval_expr(expr.strip())
-                except Exception as e:
-                    print(_("basic_runtime_error", str(e)))
+                    variables[var] = eval_expr(expr.strip())
+                except (NameError, ValueError) as e:
+                    print(f"Runtime error at line {ip}: {e}")
                     break
-            elif stmt.upper().startswith("IF"):
+
+            # ----- 隐式赋值：A = 5 -----
+            elif "=" in stmt and not upper.startswith(
+                ("IF", "FOR", "PRINT", "INPUT", "GOTO", "END", "NEXT", "CLS", "REM")
+            ):
+                if not any(op in stmt for op in ("==", "<>", "<=", ">=")):
+                    var, expr = stmt.split("=", 1)
+                    var = var.strip()
+                    if is_valid_var(var):
+                        try:
+                            variables[var] = eval_expr(expr.strip())
+                        except (NameError, ValueError) as e:
+                            print(f"Runtime error at line {ip}: {e}")
+                            break
+                    else:
+                        print(f"Runtime error at line {ip}: 非法变量名 {var}")
+                        break
+                else:
+                    print(f"Unknown statement: {stmt}")
+                    break
+
+            # ----- IF ... THEN <line> -----
+            elif upper.startswith("IF"):
                 rest = stmt[2:].strip()
-                if " THEN " not in rest:
+                if " THEN " not in rest.upper():
                     print("Syntax error: missing THEN")
                     break
-                cond, target = rest.split(" THEN ", 1)
-                cond = cond.strip()
-                target = target.strip()
+                idx = rest.upper().index(" THEN ")
+                cond = rest[:idx].strip()
+                target = rest[idx + 6:].strip()
                 if not target.isdigit():
                     print(f"THEN target must be line number, got {target}")
                     break
+
                 m = re.match(
-                    r"^([A-Za-z0-9_]+)\s*(==|=|!=|<>|<|>|<=|>=)\s*([A-Za-z0-9_]+)$",
+                    r'^(.+?)\s*(==|=|!=|<>|<=|>=|<|>)\s*(.+)$',
                     cond,
                 )
                 if not m:
                     print(f"Invalid condition {cond}")
                     break
                 left, op, right = m.groups()
-                lv = int(left) if left.isdigit() else vars.get(left, left)
-                rv = int(right) if right.isdigit() else vars.get(right, right)
-                cond_true = False
-                if op in ("=", "=="):
-                    cond_true = lv == rv
-                elif op in ("<>", "!="):
-                    cond_true = lv != rv
-                elif op == "<":
-                    cond_true = lv < rv
-                elif op == ">":
-                    cond_true = lv > rv
-                elif op == "<=":
-                    cond_true = lv <= rv
-                elif op == ">=":
-                    cond_true = lv >= rv
-                if cond_true:
+
+                try:
+                    lv = get_value(left)
+                    rv = get_value(right)
+                except NameError as e:
+                    print(f"Runtime error at line {ip}: {e}")
+                    break
+
+                if isinstance(lv, str) or isinstance(rv, str):
+                    if op in ("=", "=="):
+                        truth = lv == rv
+                    elif op in ("<>", "!="):
+                        truth = lv != rv
+                    else:
+                        print(f"Runtime error at line {ip}: 字符串只支持 = 和 <> 比较")
+                        break
+                else:
+                    try:
+                        if op in ("=", "=="):
+                            truth = lv == rv
+                        elif op in ("<>", "!="):
+                            truth = lv != rv
+                        elif op == "<":
+                            truth = lv < rv
+                        elif op == ">":
+                            truth = lv > rv
+                        elif op == "<=":
+                            truth = lv <= rv
+                        elif op == ">=":
+                            truth = lv >= rv
+                        else:
+                            print(f"Runtime error at line {ip}: 未知运算符 {op}")
+                            break
+                    except TypeError as e:
+                        print(f"Runtime error at line {ip}: 类型不匹配 ({e})")
+                        break
+
+                if truth:
                     ip = int(target)
                     continue
-            elif stmt.upper().startswith("GOTO"):
+
+            # ----- GOTO -----
+            elif upper.startswith("GOTO"):
                 target = stmt[4:].strip()
                 if not target.isdigit():
                     print(f"GOTO target must be line number, got {target}")
                     break
                 ip = int(target)
                 continue
-            elif stmt.upper().startswith("FOR"):
+
+            # ----- FOR var = a TO b [STEP c] -----
+            elif upper.startswith("FOR"):
                 rest = stmt[3:].strip()
                 m = re.match(
-                    r"^([A-Za-z_]+)\s*=\s*([\d]+)\s+TO\s+([\d]+)(?:\s+STEP\s+([+-]?\d+))?$",
+                    r"^([A-Za-z][A-Za-z0-9_]*\$?)\s*=\s*(-?\d+)\s+TO\s+(-?\d+)(?:\s+STEP\s+(-?\d+))?$",
                     rest,
                     re.IGNORECASE,
                 )
                 if not m:
-                    print(f"Syntax error: FOR {stmt}")
+                    print(f"Runtime error at line {ip}: FOR 语法错误: {stmt}")
                     break
                 var, start, end, step = m.groups()
+                if var.endswith("$"):
+                    print(f"Runtime error at line {ip}: FOR 循环变量不能是字符串变量 ({var})")
+                    break
                 start = int(start)
                 end = int(end)
                 step = int(step) if step else 1
-                vars[var] = start
+                variables[var] = start
                 next_ip = next_line(ip)
                 stack.append((var, start, end, step, next_ip))
-            elif stmt.upper().startswith("END"):
+
+            # ----- END -----
+            elif upper.startswith("END"):
                 break
+
+            # ----- CLS -----
+            elif upper.startswith("CLS"):
+                if hasattr(self, "gui_app") and self.gui_app:
+                    self.gui_app._clear_terminal()
+                else:
+                    os.system("cls" if os.name == "nt" else "clear")
+
             else:
                 print(f"Unknown statement: {stmt}")
                 break
+
             ip = next_line(ip)
 
     @command("attrib", "files", "cmd_attrib")
@@ -20244,8 +22305,16 @@ def register(api):
 
         sub = parts[0].lower()
 
+        # ===== provider：查看当前 AI 引擎状态 =====
+        if sub == "provider" or sub == "status":
+            print(f"当前 Provider : {self.ai_engine.provider or '未启用（离线）'}")
+            print(f"当前 Model    : {self.ai_engine.model or '无'}")
+            print(f"用户选择      : {self.ai_engine._model_user_choice}")
+            print(f"本地模型列表  : {', '.join(self.ai_engine.get_text_models()) or '无'}")
+            return
+
         # ===== add =====
-        if sub == "add":
+        elif sub == "add":
             if len(parts) < 3:
                 self._show_ai_help()
                 return
@@ -20399,15 +22468,52 @@ def register(api):
                         return
                     self._add_ai_rule(pattern, "自定义函数", "🔧", code=code)
 
+        # ===== model 子命令：切换模型 =====
+        elif sub == "model":
+            if len(parts) < 2:
+                # 列出可用模型
+                text_models = self.ai_engine.get_text_models()
+                if not text_models:
+                    print("❌ 未检测到任何本地模型")
+                    return
+                print("可用模型:")
+                for m in text_models:
+                    mark = "→ " if m == self.ai_engine.model else "  "
+                    print(f"{mark}{m}")
+                print(f"\n用法: ai model <模型名>  # 切换模型")
+                return
+            target = parts[1].strip()
+            available = self.ai_engine.get_text_models()
+            if target not in available:
+                print(f"❌ 模型 '{target}' 不在可用列表中")
+                print(f"可用: {', '.join(available)}")
+                return
+            self.ai_engine.model = target
+            self.ai_engine.provider = "ollama"
+            self.ai_engine._model_user_choice = True
+            self.ai_engine.messages = []
+            self.config.set("ai.model", target, self.username)
+            self.config.save_user_config(self.username)
+            print(f"✅ 已切换到模型: {target}")
+
         # ===== 普通 AI 对话 =====
         else:
             full_text = " ".join(parts)
-            # 确保模型选择（弹窗询问）
+
+            # ★ 先确保 provider 已决定（不弹窗时才直接走这里）
             if self.ai_engine._model_user_choice is None:
                 self.ai_engine._try_enable_model_sync()
-            # 获取同步回复（在线或离线）
+
+            # ★ 决定之后再打印状态
+            if self.ai_engine.provider == "ollama":
+                print(f"🤖 使用模型: {self.ai_engine.model}")
+            elif self.ai_engine.provider:
+                print(f"🤖 使用在线模型: {self.ai_engine.model}")
+            else:
+                print("🤖 使用离线模式")
+
             reply, emoji = self.ai_engine.ask_sync(full_text)
-            print(reply)
+            print(f"{emoji} {reply}")
 
     @command("memory", "system", "长期记忆管理 (add/search/remove/list)")
     def memory_cmd(self, args, src=None):
@@ -20594,7 +22700,11 @@ def register(api):
             except Exception:
                 print("[多代理] " + msg)
 
-        model_name = "qwen2.5:7b"
+        registry = getattr(self, "model_registry", None)
+        if registry:
+            model_name = registry.pick_small_text_model(max_size_gb=10) or "qwen2.5:7b"
+        else:
+            model_name = "qwen2.5:7b"
         ollama_url = "http://localhost:11434/api/generate"
 
         log_msg(f"接收需求: {user_query}")
@@ -20757,8 +22867,10 @@ def register(api):
 
         # 执行动作
         if all_actions:
-            self._execute_ai_actions(all_actions)
-            log_msg("✅ 所有动作已执行")
+            success, fail, fail_msgs = self._execute_ai_actions(all_actions)
+            log_msg(f"✅ 执行完成：成功 {success} 个，失败 {fail} 个")
+            if fail_msgs:
+                log_msg(f"❌ 失败详情: {fail_msgs}")
         else:
             log_msg("⚠️ 未解析到动作，尝试离线")
             reply, emoji = self.ai_engine._offline_reply(user_query)
@@ -20766,7 +22878,12 @@ def register(api):
             return reply
 
         # 生成总结
-        summary_prompt = f"用户需求：{user_query}。已完成动作：{all_actions}。请用2句话以内总结结果。"
+        summary_prompt = (
+            f"用户需求：{user_query}。\n"
+            f"执行结果：成功 {success} 个，失败 {fail} 个。\n"
+            f"失败详情：{fail_msgs}\n"
+            f"请用2句话以内如实总结。如果失败，要明确说明失败原因。"
+        )
         try:
             resp = requests.post(ollama_url, json={"model": model_name, "prompt": summary_prompt, "stream": False}, timeout=30)
             if resp.status_code == 200:
@@ -21026,16 +23143,14 @@ def register(api):
         fail_msgs = []
 
         def normalize_vfs_path(path, username):
-            """将Windows路径或模糊路径转换为VFS绝对路径"""
+            """将 Windows 路径或模糊路径转换为 VFS 绝对路径"""
             if not path:
                 return None
             path = path.replace("\\", "/")
-            # Windows 路径：忽略原用户名，映射到当前用户
             if path.lower().startswith("c:/users/"):
                 parts = path.split("/")
                 if len(parts) >= 3:
                     remainder = parts[3:] if len(parts) > 3 else []
-                    # 过滤空字符串
                     remainder = [p for p in remainder if p]
                     if remainder:
                         return f"{home}/" + "/".join(remainder)
@@ -21057,14 +23172,12 @@ def register(api):
             if not path:
                 cwd = self.fs.get_abs_path(self.fs.cwd)
                 return cwd if cwd != "/" else home
-            # 先尝试规范化 Windows 路径
             normalized = normalize_vfs_path(path, username)
             if normalized:
                 return normalized
             path = path.replace("\\", "/")
             if path.startswith("/"):
                 return path
-            # 特殊名称
             if path in ("桌面", "Desktop"):
                 return desktop
             if path in ("我的电脑", "此电脑"):
@@ -21073,7 +23186,6 @@ def register(api):
                 return f"{home}/Documents"
             if path in ("主目录", "home", "~"):
                 return home
-            # 相对路径：优先当前工作目录
             if default_base is None:
                 cwd = self.fs.get_abs_path(self.fs.cwd)
                 base = cwd if cwd != "/" else home
@@ -21103,32 +23215,58 @@ def register(api):
 
         for action in actions:
             try:
+                # ============ 打开 ============
                 if action[0] == "open":
                     path = action[1] if len(action) > 1 else "/"
                     path = path.replace("\\", "/")
-                    if path in ("terminal", "browser", "ai"):
-                        self._execute(path)
-                        success_count += 1
-                    else:
-                        abs_path = resolve_path(path, default_base="/")
-                        node = self.fs.resolve(abs_path, username)
-                        if node and isinstance(node, Directory):
-                            if hasattr(self, "gui_app") and self.gui_app:
-                                self.gui_app._open_fm_at(abs_path)
-                            else:
-                                self._execute(f"dir {abs_path}")
-                            success_count += 1
-                        elif node and isinstance(node, File):
-                            if hasattr(self, "gui_app") and self.gui_app:
-                                self.gui_app._open_editor_with_file(abs_path)
-                            else:
-                                self._execute(f"type {abs_path}")
+
+                    # 特殊应用
+                    special_apps = {
+                        "terminal": ("_focus_terminal", "已在终端窗口聚焦"),
+                        "browser": ("_open_browser", "正在打开浏览器"),
+                        "ai": ("_open_ai_chat", "正在打开 AI 助手"),
+                        "calc": ("_open_calc", "正在打开计算器"),
+                        "settings": ("_open_settings", "正在打开系统设置"),
+                        "trash": ("_open_trash", "正在打开回收站"),
+                        "taskmgr": ("_open_task_manager", "正在打开任务管理器"),
+                        "sysmon": ("_open_system_monitor", "正在打开系统监控"),
+                        "workspace": ("_open_workspace", "正在打开工作区"),
+                        "store": ("_open_store_gui", "正在打开应用商店"),
+                        "paint": ("_open_paint", "正在打开画图"),
+                    }
+                    if path in special_apps:
+                        method_name, msg = special_apps[path]
+                        if hasattr(self, "gui_app") and self.gui_app and hasattr(self.gui_app, method_name):
+                            getattr(self.gui_app, method_name)()
+                            self._print_log(f"✅ {msg}")
                             success_count += 1
                         else:
-                            self._print_log(f"❌ 打开失败，路径不存在: {abs_path}")
+                            self._print_log(f"❌ GUI 不可用，无法{msg}")
                             fail_count += 1
-                            fail_msgs.append(f"路径不存在: {abs_path}")
+                            fail_msgs.append(f"GUI 不可用: {path}")
+                        continue
 
+                    # 普通路径
+                    abs_path = resolve_path(path, default_base="/")
+                    node = self.fs.resolve(abs_path, username)
+                    if node and isinstance(node, Directory):
+                        if hasattr(self, "gui_app") and self.gui_app:
+                            self.gui_app._open_fm_at(abs_path)
+                        else:
+                            self._execute(f"dir {abs_path}")
+                        success_count += 1
+                    elif node and isinstance(node, File):
+                        if hasattr(self, "gui_app") and self.gui_app:
+                            self.gui_app._open_editor_with_file(abs_path)
+                        else:
+                            self._execute(f"type {abs_path}")
+                        success_count += 1
+                    else:
+                        self._print_log(f"❌ 打开失败，路径不存在: {abs_path}")
+                        fail_count += 1
+                        fail_msgs.append(f"路径不存在: {abs_path}")
+
+                # ============ 新建文件夹 ============
                 elif action[0] == "new_folder":
                     folder_name = action[1]
                     abs_path = resolve_path(folder_name)
@@ -21139,12 +23277,13 @@ def register(api):
                         else:
                             self._print_log(f"❌ 创建文件夹失败: {abs_path}")
                             fail_count += 1
-                            fail_msgs.append(f"创建文件夹失败: {abs_path}")
+                            fail_msgs.append(f"创建失败: {abs_path}")
                     else:
-                        self._print_log(f"❌ 创建文件夹失败（父目录无法创建）: {abs_path}")
+                        self._print_log(f"❌ 无法创建父目录: {abs_path}")
                         fail_count += 1
-                        fail_msgs.append(f"创建文件夹失败（父目录无法创建）: {abs_path}")
+                        fail_msgs.append(f"父目录创建失败: {abs_path}")
 
+                # ============ 新建文件 ============
                 elif action[0] == "new_file":
                     file_path = action[1]
                     content = action[2] if len(action) > 2 else ""
@@ -21156,12 +23295,13 @@ def register(api):
                         else:
                             self._print_log(f"❌ 创建文件失败: {abs_path}")
                             fail_count += 1
-                            fail_msgs.append(f"创建文件失败: {abs_path}")
+                            fail_msgs.append(f"创建失败: {abs_path}")
                     else:
-                        self._print_log(f"❌ 创建文件失败（父目录无法创建）: {abs_path}")
+                        self._print_log(f"❌ 无法创建父目录: {abs_path}")
                         fail_count += 1
-                        fail_msgs.append(f"创建文件失败（父目录无法创建）: {abs_path}")
+                        fail_msgs.append(f"父目录创建失败: {abs_path}")
 
+                # ============ 写入文件 ============
                 elif action[0] == "write_file":
                     file_path = action[1]
                     content = action[2] if len(action) > 2 else ""
@@ -21171,132 +23311,19 @@ def register(api):
                             self._print_log(f"✅ 写入文件成功: {abs_path}")
                             success_count += 1
                         else:
-                            self._print_log(f"❌ 写入文件失败: {abs_path}")
+                            self._print_log(f"❌ 写入失败: {abs_path}")
                             fail_count += 1
-                            fail_msgs.append(f"写入文件失败: {abs_path}")
+                            fail_msgs.append(f"写入失败: {abs_path}")
                     else:
-                        self._print_log(f"❌ 写入文件失败（父目录无法创建）: {abs_path}")
+                        self._print_log(f"❌ 无法创建父目录: {abs_path}")
                         fail_count += 1
-                        fail_msgs.append(f"写入文件失败（父目录无法创建）: {abs_path}")
+                        fail_msgs.append(f"父目录创建失败: {abs_path}")
 
-                elif action[0] == "rename":
-                    old_path = action[1]
-                    new_name = action[2]
-                    abs_old = resolve_path(old_path)
-                    parent = os.path.dirname(abs_old)
-                    abs_new = f"{parent}/{new_name}" if parent != "/" else f"/{new_name}"
-                    if self.fs.move(abs_old, abs_new, username):
-                        self._print_log(f"✅ 重命名成功: {abs_old} -> {abs_new}")
-                        success_count += 1
-                    else:
-                        self._print_log(f"❌ 重命名失败: {abs_old}")
-                        fail_count += 1
-                        fail_msgs.append(f"重命名失败: {abs_old}")
-
-                elif action[0] == "delete":
-                    path = action[1]
-                    abs_path = resolve_path(path)
-                    if self.fs.move_to_trash(abs_path, username)[0]:
-                        self._print_log(f"🗑️ 删除成功: {abs_path}")
-                        success_count += 1
-                    else:
-                        self._print_log(f"❌ 删除失败: {abs_path}")
-                        fail_count += 1
-                        fail_msgs.append(f"删除失败: {abs_path}")
-
-                elif action[0] == "empty_trash":
-                    self.fs.empty_trash(username)
-                    self._print_log("♻️ 回收站已清空")
-                    success_count += 1
-
-                elif action[0] == "move":
-                    src, dst = action[1], action[2]
-                    abs_src = resolve_path(src)
-                    abs_dst = resolve_path(dst)
-                    dst_node = self.fs.resolve(abs_dst, username)
-                    if dst_node and isinstance(dst_node, Directory):
-                        base = os.path.basename(abs_src)
-                        abs_dst = f"{abs_dst}/{base}"
-                    if ensure_parent_dirs(abs_dst):
-                        if self.fs.move(abs_src, abs_dst, username):
-                            self._print_log(f"📦 移动成功: {abs_src} -> {abs_dst}")
-                            success_count += 1
-                        else:
-                            self._print_log(f"❌ 移动失败: {abs_src} -> {abs_dst}")
-                            fail_count += 1
-                            fail_msgs.append(f"移动失败: {abs_src} -> {abs_dst}")
-                    else:
-                        self._print_log(f"❌ 移动失败（父目录无法创建）: {abs_dst}")
-                        fail_count += 1
-                        fail_msgs.append(f"移动失败: {abs_dst}")
-
-                elif action[0] == "copy":
-                    src, dst = action[1], action[2]
-                    abs_src = resolve_path(src)
-                    abs_dst = resolve_path(dst)
-                    dst_node = self.fs.resolve(abs_dst, username)
-                    if dst_node and isinstance(dst_node, Directory):
-                        base = os.path.basename(abs_src)
-                        abs_dst = f"{abs_dst}/{base}"
-                    if ensure_parent_dirs(abs_dst):
-                        if self.fs.copy(abs_src, abs_dst, username):
-                            self._print_log(f"📋 复制成功: {abs_src} -> {abs_dst}")
-                            success_count += 1
-                        else:
-                            self._print_log(f"❌ 复制失败: {abs_src} -> {abs_dst}")
-                            fail_count += 1
-                            fail_msgs.append(f"复制失败: {abs_src} -> {abs_dst}")
-                    else:
-                        self._print_log(f"❌ 复制失败（父目录无法创建）: {abs_dst}")
-                        fail_count += 1
-                        fail_msgs.append(f"复制失败: {abs_dst}")
-
-                elif action[0] == "cd":
-                    path = action[1]
-                    abs_path = resolve_path(path, default_base=home)
-                    node = self.fs.resolve(abs_path, username)
-                    if node and isinstance(node, Directory):
-                        self.fs.cwd = node
-                        self._print_log(f"📂 切换到目录: {abs_path}")
-                        success_count += 1
-                    else:
-                        self._print_log(f"❌ 目录不存在: {abs_path}")
-                        fail_count += 1
-                        fail_msgs.append(f"目录不存在: {abs_path}")
-
-                elif action[0] == "list_dir":
-                    cwd = self.fs.get_abs_path(self.fs.cwd)
-                    items = self.fs.listdir(cwd, username) or []
-                    if items:
-                        self._print_log(f"📂 {cwd} 下的内容:\n" + "\n".join(sorted(items)))
-                    else:
-                        self._print_log(f"📂 {cwd}（空目录）")
-                    success_count += 1
-
-                elif action[0] == "execute":
-                    cmd = action[1]
-                    # 捕获命令输出，通过 _print_log 路由到正确位置
-                    import io
-                    from contextlib import redirect_stdout, redirect_stderr
-                    out_buf = io.StringIO()
-                    err_buf = io.StringIO()
-                    try:
-                        with redirect_stdout(out_buf), redirect_stderr(err_buf):
-                            self._execute(cmd)
-                        output = out_buf.getvalue() + err_buf.getvalue()
-                        if output:
-                            self._print_log(output)
-                        success_count += 1
-                    except Exception as e:
-                        self._print_log(f"❌ 命令执行失败: {e}")
-                        fail_count += 1
-                        fail_msgs.append(f"命令执行失败: {e}")
-
+                # ============ 读取文件 ============
                 elif action[0] == "read_file":
                     path = action[1]
                     abs_path = resolve_path(path)
                     node = self.fs.resolve(abs_path, username)
-                    # 若找不到，尝试常见位置
                     if node is None and not path.startswith("/"):
                         cwd = self.fs.get_abs_path(self.fs.cwd)
                         for cand in [f"{cwd}/{path}", f"{home}/{path}",
@@ -21316,6 +23343,139 @@ def register(api):
                         fail_count += 1
                         fail_msgs.append(f"文件不存在: {abs_path}")
 
+                # ============ 重命名 ============
+                elif action[0] == "rename":
+                    old_path = action[1]
+                    new_name = action[2]
+                    abs_old = resolve_path(old_path)
+                    parent = os.path.dirname(abs_old)
+                    abs_new = f"{parent}/{new_name}" if parent != "/" else f"/{new_name}"
+                    if self.fs.move(abs_old, abs_new, username):
+                        self._print_log(f"✅ 重命名成功: {abs_old} -> {abs_new}")
+                        success_count += 1
+                    else:
+                        self._print_log(f"❌ 重命名失败: {abs_old}")
+                        fail_count += 1
+                        fail_msgs.append(f"重命名失败: {abs_old}")
+
+                # ============ 删除（移入回收站） ============
+                elif action[0] == "delete":
+                    path = action[1]
+                    abs_path = resolve_path(path)
+                    if self.fs.move_to_trash(abs_path, username)[0]:
+                        self._print_log(f"🗑️ 已移入回收站: {abs_path}")
+                        success_count += 1
+                    else:
+                        self._print_log(f"❌ 删除失败: {abs_path}")
+                        fail_count += 1
+                        fail_msgs.append(f"删除失败: {abs_path}")
+
+                # ============ 永久删除 ============
+                elif action[0] == "permanent_delete":
+                    path = action[1]
+                    abs_path = resolve_path(path)
+                    if self.fs.delete(abs_path, username, permanent=True):
+                        self._print_log(f"🔥 已永久删除: {abs_path}")
+                        success_count += 1
+                    else:
+                        self._print_log(f"❌ 永久删除失败: {abs_path}")
+                        fail_count += 1
+                        fail_msgs.append(f"永久删除失败: {abs_path}")
+
+                # ============ 清空回收站 ============
+                elif action[0] == "empty_trash":
+                    self.fs.empty_trash(username)
+                    self._print_log("♻️ 回收站已清空")
+                    success_count += 1
+
+                # ============ 移动 ============
+                elif action[0] == "move":
+                    src, dst = action[1], action[2]
+                    abs_src = resolve_path(src)
+                    abs_dst = resolve_path(dst)
+                    dst_node = self.fs.resolve(abs_dst, username)
+                    if dst_node and isinstance(dst_node, Directory):
+                        base = os.path.basename(abs_src)
+                        abs_dst = f"{abs_dst}/{base}"
+                    if ensure_parent_dirs(abs_dst):
+                        if self.fs.move(abs_src, abs_dst, username):
+                            self._print_log(f"📦 移动成功: {abs_src} -> {abs_dst}")
+                            success_count += 1
+                        else:
+                            self._print_log(f"❌ 移动失败: {abs_src} -> {abs_dst}")
+                            fail_count += 1
+                            fail_msgs.append(f"移动失败: {abs_src} -> {abs_dst}")
+                    else:
+                        self._print_log(f"❌ 无法创建父目录: {abs_dst}")
+                        fail_count += 1
+                        fail_msgs.append(f"父目录创建失败: {abs_dst}")
+
+                # ============ 复制 ============
+                elif action[0] == "copy":
+                    src, dst = action[1], action[2]
+                    abs_src = resolve_path(src)
+                    abs_dst = resolve_path(dst)
+                    dst_node = self.fs.resolve(abs_dst, username)
+                    if dst_node and isinstance(dst_node, Directory):
+                        base = os.path.basename(abs_src)
+                        abs_dst = f"{abs_dst}/{base}"
+                    if ensure_parent_dirs(abs_dst):
+                        if self.fs.copy(abs_src, abs_dst, username):
+                            self._print_log(f"📋 复制成功: {abs_src} -> {abs_dst}")
+                            success_count += 1
+                        else:
+                            self._print_log(f"❌ 复制失败: {abs_src} -> {abs_dst}")
+                            fail_count += 1
+                            fail_msgs.append(f"复制失败: {abs_src} -> {abs_dst}")
+                    else:
+                        self._print_log(f"❌ 无法创建父目录: {abs_dst}")
+                        fail_count += 1
+                        fail_msgs.append(f"父目录创建失败: {abs_dst}")
+
+                # ============ 切换目录 ============
+                elif action[0] == "cd":
+                    path = action[1]
+                    abs_path = resolve_path(path, default_base=home)
+                    node = self.fs.resolve(abs_path, username)
+                    if node and isinstance(node, Directory):
+                        self.fs.cwd = node
+                        self._print_log(f"📂 切换到目录: {abs_path}")
+                        success_count += 1
+                    else:
+                        self._print_log(f"❌ 目录不存在: {abs_path}")
+                        fail_count += 1
+                        fail_msgs.append(f"目录不存在: {abs_path}")
+
+                # ============ 列出目录 ============
+                elif action[0] == "list_dir":
+                    cwd = self.fs.get_abs_path(self.fs.cwd)
+                    items = self.fs.listdir(cwd, username) or []
+                    if items:
+                        self._print_log(f"📂 {cwd} 下的内容:\n" + "\n".join(sorted(items)))
+                    else:
+                        self._print_log(f"📂 {cwd}（空目录）")
+                    success_count += 1
+
+                # ============ 执行命令 ============
+                elif action[0] == "execute":
+                    cmd = action[1]
+                    import io
+                    from contextlib import redirect_stderr, redirect_stdout
+                    out_buf = io.StringIO()
+                    err_buf = io.StringIO()
+                    try:
+                        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                            self._execute(cmd)
+                        output = out_buf.getvalue() + err_buf.getvalue()
+                        if output:
+                            self._print_log(output)
+                        success_count += 1
+                    except Exception as e:
+                        self._print_log(f"❌ 命令执行失败: {e}")
+                        fail_count += 1
+                        fail_msgs.append(f"命令执行失败: {e}")
+
+                # ============ 搜索文件 ============
                 elif action[0] == "search_file":
                     keyword = action[1]
                     items = self.fs.listdir(self.fs.get_abs_path(self.fs.cwd), username) or []
@@ -21328,10 +23488,93 @@ def register(api):
                         fail_count += 1
                         fail_msgs.append(f"未找到匹配 '{keyword}' 的文件")
 
+                # ============ 更改壁纸 ============
+                elif action[0] == "change_wallpaper":
+                    color = action[1]
+                    self.config.set("desktop.wallpaper", color, username)
+                    self.config.save_user_config(username)
+                    if hasattr(self, "gui_app") and self.gui_app:
+                        try:
+                            self.gui_app._update_wallpaper()
+                        except Exception:
+                            pass
+                    self._print_log(f"🎨 壁纸已更改为 {color}")
+                    success_count += 1
+
+                # ============ 新增用户 ============
+                elif action[0] == "add_user":
+                    uname = action[1]
+                    pwd = action[2] if len(action) > 2 else ""
+                    if not uname or not pwd:
+                        fail_count += 1
+                        fail_msgs.append("add_user 缺少用户名或密码")
+                        continue
+                    uname = uname.strip().lower()
+                    if uname in self.RESERVED_USERNAMES:
+                        fail_count += 1
+                        fail_msgs.append(f"不能创建保留用户名: {uname}")
+                        continue
+                    if len(pwd) < 6:
+                        fail_count += 1
+                        fail_msgs.append("密码至少需要 6 位")
+                        continue
+                    with self._lock:
+                        if uname in self.users:
+                            fail_count += 1
+                            fail_msgs.append(f"用户已存在: {uname}")
+                            continue
+                        self.users[uname] = hash_password(pwd)
+                    self._save_users()
+                    self.ensure_home(uname)
+                    self.fs._audit(f"ADDUSER {uname}", username)
+                    self._print_log(f"✅ 用户 {uname} 已创建")
+                    success_count += 1
+
+                # ============ 删除用户 ============
+                elif action[0] == "delete_user":
+                    uname = (action[1] or "").strip().lower()
+                    if not self._is_admin():
+                        fail_count += 1
+                        fail_msgs.append("只有管理员可以删除用户")
+                        continue
+                    if uname == "root" or uname not in self.users:
+                        fail_count += 1
+                        fail_msgs.append(f"无效用户: {uname}")
+                        continue
+                    if uname == username:
+                        fail_count += 1
+                        fail_msgs.append("不能删除当前登录用户")
+                        continue
+                    with self._lock:
+                        del self.users[uname]
+                    home_dir = f"/home/{uname}"
+                    if self.fs.resolve(home_dir, "root"):
+                        self.fs.delete(home_dir, "root", permanent=True)
+                    self._save_users()
+                    self.fs._audit(f"DELUSER {uname}", username)
+                    self._print_log(f"✅ 用户 {uname} 已删除")
+                    success_count += 1
+
+                # ============ 改密 ============
+                elif action[0] == "change_password":
+                    new_pwd = action[1]
+                    if not new_pwd or len(new_pwd) < 6:
+                        fail_count += 1
+                        fail_msgs.append("密码至少需要 6 位")
+                        continue
+                    with self._lock:
+                        self.users[username] = hash_password(new_pwd)
+                    self._save_users()
+                    self.fs._audit(f"PASSWD {username}", username)
+                    self._print_log("✅ 密码已修改")
+                    success_count += 1
+
+                # ============ 未知动作 ============
                 else:
                     self._print_log(f"未知动作: {action}")
                     fail_count += 1
                     fail_msgs.append(f"未知动作: {action}")
+
             except Exception as e:
                 self._print_log(f"执行动作失败: {action} - {e}")
                 fail_count += 1
@@ -21417,42 +23660,77 @@ def register(api):
                     pass
             # ==================================
             import multiprocessing
+            import threading
+
             output_queue = multiprocessing.Queue()
             p = multiprocessing.Process(
                 target=_safe_exec_sandbox_target,
                 args=(code_part, output_queue, None, allowed, temp_cwd),
+                daemon=True,
             )
             p.start()
-            p.join(timeout=60)
-            output = ""
-            error = ""
-            if not output_queue.empty():
-                msg = output_queue.get()
-                if msg[0] == "result":
-                    output, error = msg[1], msg[2]
-                elif msg[0] == "exception":
-                    error = msg[1]
-            if p.is_alive():
-                p.terminate()
-                p.join()
-                error += "\n⚠️ 沙盒执行超时，已被强制终止。"
-            # 清理临时目录
-            shutil.rmtree(temp_cwd, ignore_errors=True)
-            # 输出结果
-            if output:
-                if self.gui_app:
-                    self.gui_app._print(output)
+
+            def wait_worker():
+                p.join(timeout=60)
+
+                if p.is_alive():
+                    p.terminate()
+                    p.join(timeout=2)
+                    if p.is_alive():
+                        try:
+                            p.kill()
+                        except Exception:
+                            pass
+                    out_text = ""
+                    err_text = "⚠️ 沙盒执行超时（60秒），已被强制终止。"
                 else:
-                    print(output, end="")
-            if error:
-                if self.gui_app:
-                    self.gui_app._print(error)
-                else:
-                    print(error, end="")
+                    out_text = ""
+                    err_text = ""
+                    try:
+                        msg = output_queue.get_nowait()
+                        if msg[0] == "result":
+                            out_text = msg[1]
+                            err_text = msg[2]
+                        elif msg[0] == "exception":
+                            err_text = msg[1]
+                    except Exception:
+                        pass
+
+                # 清理临时目录（无论成功失败都要清）
+                try:
+                    shutil.rmtree(temp_cwd, ignore_errors=True)
+                except Exception:
+                    pass
+
+                def update_ui():
+                    if self.gui_app and self.gui_app.winfo_exists():
+                        if out_text:
+                            self.gui_app._print(out_text)
+                        if err_text:
+                            self.gui_app._print(err_text)
+                        self.gui_app.event_generate("<<CommandDone>>")
+                    else:
+                        if out_text:
+                            print(out_text, end="")
+                        if err_text:
+                            print(err_text, end="")
+                        self._print_prompt()
+
+                try:
+                    if self.gui_app and self.gui_app.winfo_exists():
+                        self.gui_app.after(0, update_ui)
+                    else:
+                        update_ui()
+                except Exception:
+                    try:
+                        update_ui()
+                    except Exception:
+                        pass
+
+            threading.Thread(target=wait_worker, daemon=True).start()
             return
         # =============================================
 
-        # ---------- 原有逻辑 ----------
         # ===== GUI 模式 =====
         if hasattr(self, "gui_app") and self.gui_app and self.gui_app.winfo_exists():
             # 处理 -c 参数：执行代码（已在上方拦截，这里不再重复）
@@ -21807,12 +24085,7 @@ def register(api):
                                 ):
                                     return
                             else:
-                                overwrite = (
-                                    input(f"应用 '{app_name}' 已存在，是否覆盖？(y/n): ")
-                                    .strip()
-                                    .lower()
-                                )
-                                if overwrite != "y":
+                                if not self._ask_user("覆盖确认", f"应用 '{app_name}' 已存在，是否覆盖？", mode="yesno"):
                                     return
                             shutil.rmtree(target_app_dir)
                         shutil.move(tmpdir, target_app_dir)
@@ -22535,10 +24808,6 @@ def register(api):
         print("命令已重新加载")
 
     def _format_perm(self, node):
-        if isinstance(node, Directory):
-            pass
-        else:
-            pass
         perms = ""
         for u in range(3):
             mode = (node.mode >> (6 - u * 3)) & 0o7
@@ -22721,7 +24990,15 @@ def register(api):
         try:
             self._ai_provider = self.config.get("ai.provider", "mock")
             self._ai_key = os.environ.get("KIKI_AI_API_KEY", self.config.get("ai.api_key", ""))
-            self._ai_model = self.config.get("ai.model", "gpt-3.5-turbo")
+
+            # ★ 直接用配置里的模型名，不做任何网络查询
+            configured = self.config.get("ai.model", "auto")
+            if not configured or configured in ("auto", "gpt-3.5-turbo", "mock"):
+                # 未设置 → 先留空，等用户主动触发时再决定
+                self._ai_model = ""
+            else:
+                self._ai_model = configured
+
             self._ai_url = self.config.get(
                 "ai.base_url", "https://api.openai.com/v1/chat/completions"
             )
@@ -22731,7 +25008,7 @@ def register(api):
             logging.error(f"AI配置应用失败: {e}", exc_info=True)
             self._ai_provider = "mock"
             self._ai_key = ""
-            self._ai_model = "gpt-3.5-turbo"
+            self._ai_model = ""
             self._ai_url = "https://api.openai.com/v1/chat/completions"
             self._ai_system = "You are a helpful assistant."
             self._ai_msgs = []
@@ -22886,21 +25163,8 @@ def register(api):
             return
         # ============================================
 
-        # ---------- 重定向解析 ----------
-        redirect_mode = None
-        redirect_file = None
-        if ">>" in cmd_line:
-            parts = cmd_line.split(">>", 1)
-            if len(parts) == 2:
-                cmd_line = parts[0].strip()
-                redirect_file = parts[1].strip().strip("\"'")
-                redirect_mode = ">>"
-        elif ">" in cmd_line:
-            parts = cmd_line.split(">", 1)
-            if len(parts) == 2:
-                cmd_line = parts[0].strip()
-                redirect_file = parts[1].strip().strip("\"'")
-                redirect_mode = ">"
+        # ---------- 重定向解析（尊重引号） ----------
+        cmd_line, redirect_mode, redirect_file = self._split_redirect_safe(cmd_line)
 
         if redirect_mode:
             if hasattr(self, "_execute_and_capture"):
@@ -23086,7 +25350,11 @@ def register(api):
         """pftest [循环次数]  - 运行 CPU 性能测试"""
         import time
 
-        import tqdm
+        try:
+            import tqdm
+        except ImportError:
+            print("❌ 需要安装 tqdm: pip install tqdm")
+            return
 
         # 解析参数
         max_loop = None
@@ -23097,8 +25365,16 @@ def register(api):
                 print("请输入有效的整数作为循环次数，或留空使用交互模式")
                 return
 
+        # GUI 模式下必须有参数（无法交互）
         if max_loop is None:
-            # 交互模式（纯终端用），GUI 下不建议
+            if hasattr(self, "gui_app") and self.gui_app:
+                print("⚠️ GUI 模式下 pftest 需要指定循环次数")
+                print("用法: pftest <循环次数>")
+                print("示例: pftest 1000000")
+                print("推荐值: 1000000 ~ 10000000")
+                return
+
+            # 交互模式（纯终端）
             print("🧪 TTYMark CPU 性能测试")
             print("选择测试难度 (循环次数):")
             options = {
@@ -23119,12 +25395,16 @@ def register(api):
                     print("  c - 自定义")
                 else:
                     print(f"  {k} - {v:,}")
-            choice = input("选择 (1-10 或 c): ").strip()
+            try:
+                choice = input("选择 (1-10 或 c): ").strip()
+            except EOFError:
+                print("无输入，退出")
+                return
 
             if choice == "c":
                 try:
                     max_loop = int(input("输入循环次数: "))
-                except ValueError:
+                except (ValueError, EOFError):
                     print("无效输入")
                     return
             elif choice in options:
@@ -23741,7 +26021,7 @@ def register(api):
             os.system("cls" if os.name == "nt" else "clear")
 
         # ===== Logo =====
-        logo = """
+        logo = f"""
     ╔═══════════════════════════════════════════════════════════════╗
     ║                                                               ║
     ║   ██╗  ██╗██╗██╗  ██╗██╗     ██████╗ ███████╗               ║
@@ -23758,7 +26038,7 @@ def register(api):
     ║             ╚██████╔╝███████║                               ║
     ║              ╚═════╝ ╚══════╝                               ║
     ║                                                               ║
-    ║                    KIKI OS v7.0                              ║
+    ║                    KIKI OS v{KIKI_VERSION}                              ║
     ║                                                               ║
     ╚═══════════════════════════════════════════════════════════════╝
         """
@@ -23895,22 +26175,7 @@ def register(api):
                         continue
                     with self._lock:
                         self.history.append(cmd_line)
-                    redirect_mode = None
-                    redirect_file = None
-                    if ">>" in cmd_line:
-                        parts = cmd_line.split(">>", 1)
-                        if len(parts) == 2:
-                            cmd_part = parts[0].strip()
-                            redirect_file = parts[1].strip()
-                            redirect_mode = ">>"
-                            cmd_line = cmd_part
-                    elif ">" in cmd_line:
-                        parts = cmd_line.split(">", 1)
-                        if len(parts) == 2:
-                            cmd_part = parts[0].strip()
-                            redirect_file = parts[1].strip()
-                            redirect_mode = ">"
-                            cmd_line = cmd_part
+                    cmd_line, redirect_mode, redirect_file = self._split_redirect_safe(cmd_line)
                     bg = cmd_line.endswith("&")
                     if bg:
                         cmd_line = cmd_line[:-1].strip()
@@ -24127,19 +26392,40 @@ class PluginManager:
         self.plugins_dir = os.path.join(KIKI_DATA_DIR, "plugins")
 
     def _load_trusted_plugins(self):
+        """加载已信任插件表：{plugin_name: source_hash}"""
         try:
             content = self.shell.fs.read_file("/home/admin/.kiki_trusted_plugins", "admin")
             if content:
-                return json.loads(content)
-        except:
+                data = json.loads(content)
+                # 兼容旧版本（旧版是 list）
+                if isinstance(data, list):
+                    return {name: None for name in data}   # 旧条目升级为"未知哈希"→首次会重新问
+                if isinstance(data, dict):
+                    return data
+        except Exception:
             pass
-        return []
+        return {}
 
     def _save_trusted_plugins(self):
+        """保存信任表"""
         try:
-            self.shell.fs.write_file("/home/admin/.kiki_trusted_plugins", json.dumps(self.trusted_plugins), "admin")
-        except:
+            self.shell.fs.write_file(
+                "/home/admin/.kiki_trusted_plugins",
+                json.dumps(self.trusted_plugins),
+                "admin"
+            )
+        except Exception:
             pass
+
+    @staticmethod
+    def _plugin_hash(path):
+        """算插件文件 sha256"""
+        import hashlib
+        try:
+            with open(path, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except Exception:
+            return ""
 
     def load_all(self):
         """扫描 plugins/ 目录，加载所有 .py 插件"""
@@ -24154,6 +26440,25 @@ class PluginManager:
                 self.load_plugin(name)
         self.loaded = True
 
+    def _static_read_plugin_info(self, path):
+        """用 ast 静态解析 plugin_info，不执行任何代码"""
+        import ast
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                tree = ast.parse(f.read(), filename=path)
+        except Exception:
+            return None
+
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "plugin_info":
+                        try:
+                            return ast.literal_eval(node.value)
+                        except Exception:
+                            return None
+        return None
+
     def load_plugin(self, name):
         import importlib.util
         import os
@@ -24165,48 +26470,126 @@ class PluginManager:
             print(f"❌ 插件文件 {path} 不存在")
             return False
 
-        if hasattr(self.gui, "winfo_exists") and self.gui.winfo_exists():
-            if name not in self.trusted_plugins:
-                if not messagebox.askyesno(
-                    "加载插件确认", f"是否允许加载插件 '{name}'？", icon="warning"
-                ):
+        # ========== ★ 哈希校验（替换原信任检查） ==========
+        current_hash = self._plugin_hash(path)
+        stored_hash = self.trusted_plugins.get(name)
+
+        need_confirm = False
+        prompt_title = ""
+        prompt_text = ""
+
+        if stored_hash is None:
+            need_confirm = True
+            prompt_title = "加载插件确认"
+            prompt_text = f"首次加载插件 '{name}'。\n\n是否允许？"
+        elif stored_hash != current_hash:
+            need_confirm = True
+            prompt_title = "⚠️ 插件已更新"
+            prompt_text = (
+                f"插件 '{name}' 的内容已改变。\n\n"
+                f"旧哈希: {stored_hash[:16]}...\n"
+                f"新哈希: {current_hash[:16]}...\n\n"
+                f"是否仍然信任？"
+            )
+        # stored_hash == current_hash → 已信任且未变，直接加载
+
+        if need_confirm:
+            if hasattr(self.gui, "winfo_exists") and self.gui.winfo_exists():
+                if not messagebox.askyesno(prompt_title, prompt_text, icon="warning"):
                     print(f"用户取消了插件加载: {name}")
                     return False
-                else:
-                    self.trusted_plugins.append(name)
-                    self._save_trusted_plugins()
-
-        spec = importlib.util.spec_from_file_location(name, path)
-        module = importlib.util.module_from_spec(spec)
-        try:
-            spec.loader.exec_module(module)
-            if not hasattr(module, "plugin_info") or not callable(
-                getattr(module, "register", None)
-            ):
-                print(f"❌ 插件 {name} 缺少 plugin_info 或 register 函数")
+            else:
+                print(f"⚠️ 非 GUI 环境，拒绝加载未授权插件: {name}")
                 return False
-        except Exception as e:
-            print(f"❌ 加载插件 {name} 失败: {e}")
+
+            self.trusted_plugins[name] = current_hash
+            self._save_trusted_plugins()
+        # ========== ★ 校验结束 ==========
+
+
+        # ========== ★ 静态读取 plugin_info（不执行任何插件代码） ==========
+        info = self._static_read_plugin_info(path)
+        if info is None:
+            print(f"❌ 插件 {name} 缺少合法的 plugin_info")
             return False
 
-        if self.api is None:
+        # 校验注册的入口函数是否存在于源码里（静态 AST 检查）
+        declared_funcs = self._list_plugin_functions(path)
+
+        # 决定要注册哪些命令
+        commands = info.get("commands")
+        if not commands:
+            # 兼容旧格式：没有 commands 声明，就把插件名当作命令名，
+            # 入口函数名默认 "main"
+            commands = [{"name": name, "func": info.get("entry", "main"),
+                         "help": info.get("description", "插件命令")}]
+
+        # 校验所有声明的 func 真实存在
+        for cmd in commands:
+            fn = cmd.get("func")
+            if fn and fn not in declared_funcs:
+                print(f"⚠️ 插件 {name} 声明的函数 '{fn}' 在源码中不存在，已跳过")
+                continue
+
+            cmd_name = cmd.get("name") or name
+            help_text = cmd.get("help", "插件命令")
+
+            # 用闭包固定 plugin_path 和函数名
+            def _make_runner(plugin_path=path, func_name=fn, plugin_name=name):
+                def runner(args=None, src=None):
+                    output, error = _run_plugin_script(
+                        plugin_path, func_name, args or ""
+                    )
+                    if error:
+                        msg = f"❌ {error}"
+                        if hasattr(self.gui, "winfo_exists") and self.gui.winfo_exists():
+                            self.gui._print(msg + "\n")
+                        else:
+                            print(msg)
+                    elif output:
+                        if hasattr(self.gui, "winfo_exists") and self.gui.winfo_exists():
+                            self.gui._print(output)
+                        else:
+                            print(output)
+                return runner
+
+            # 注册到命令表
+            if isinstance(self.shell._command_registry, types.MappingProxyType):
+                self.shell._command_registry = dict(self.shell._command_registry)
+            self.shell._command_registry[cmd_name] = (
+                _make_runner(), help_text, "plugin"
+            )
+            self.shell.COMMANDS = types.MappingProxyType(self.shell._command_registry)
+
+        # 菜单项（静态声明，可选）
+        menu_items = info.get("menu_items", [])
+        if menu_items and self.api is None:
             self.api = PluginAPI(self.gui, self.shell)
-        self.api.set_current_plugin(name)
+        if menu_items:
+            self.api.set_current_plugin(name)
+            for mi in menu_items:
+                text = mi.get("text", name)
+                func_name = mi.get("func")
+                parent = mi.get("parent", "插件")
 
-        # 确保 _command_registry 是普通字典（可能被映射为只读）
-        if isinstance(self.shell._command_registry, types.MappingProxyType):
-            self.shell._command_registry = dict(self.shell._command_registry)
+                def _make_menu_cb(plugin_path=path, fn=func_name):
+                    def cb():
+                        output, error = _run_plugin_script(plugin_path, fn, "")
+                        if error:
+                            print(f"❌ {error}")
+                        elif output:
+                            print(output)
+                    return cb
 
-        # 在主进程中执行 register（注册命令和菜单）
-        try:
-            module.register(self.api)
-        except Exception as e:
-            print(f"❌ 插件 register 执行失败: {e}")
-            return False
+                self.api.add_menu_item(text, _make_menu_cb(), parent)
 
-        # 保存插件信息
-        self.plugin_modules[name] = module
-        self.plugins[name] = module.plugin_info
+        # 保存元数据
+        self.plugin_modules[name] = None       # 不再持有 module 对象
+        self.plugins[name] = info
+
+        print(f"✅ 插件 {name} 加载成功（静态模式，未执行任何插件代码）")
+        return True
+        # ========== ★ 静态读取结束 ==========
 
         # ===== 替换已注册命令为 subprocess 隔离版 =====
         if name in self.api._func_map:
@@ -24214,7 +26597,6 @@ class PluginManager:
                 if cmd_name in self.shell._command_registry:
                     plugin_path = path
 
-                    # 创建 subprocess 隔离包装器（不会导入主模块，避免卡死）
                     def sandbox_cmd(
                         args=None,
                         src=None,
@@ -24233,7 +26615,6 @@ class PluginManager:
                             else:
                                 print(output)
 
-                    # 替换到 _command_registry，并刷新 COMMANDS
                     self.shell._command_registry[cmd_name] = (
                         sandbox_cmd,
                         self.shell._command_registry[cmd_name][1],
@@ -24244,6 +26625,52 @@ class PluginManager:
 
         print(f"✅ 插件 {name} 加载成功")
         return True
+
+    @staticmethod
+    def _static_read_plugin_info(path):
+        """
+        用 ast 静态解析 plugin_info 变量，不执行任何代码。
+        返回 dict 或 None。
+        """
+        import ast
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                source = f.read()
+            tree = ast.parse(source, filename=path)
+        except Exception:
+            return None
+
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "plugin_info":
+                        try:
+                            value = ast.literal_eval(node.value)
+                            if isinstance(value, dict):
+                                return value
+                        except Exception:
+                            return None
+        return None
+
+    @staticmethod
+    def _list_plugin_functions(path):
+        """
+        静态列出插件源码里定义的所有函数名（顶层 + 类方法）。
+        返回 set。
+        """
+        import ast
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                source = f.read()
+            tree = ast.parse(source, filename=path)
+        except Exception:
+            return set()
+
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(node.name)
+        return names
 
     def unload_plugin(self, name):
         """卸载插件（通过 API 清理注册项）"""
@@ -24924,7 +27351,6 @@ class KIKIGUI(ctk.CTk):
         # ===== 先创建终端面板，让 _print 可以工作 =====
         self._pending_output = []  # 批量输出缓冲区
         self._flush_after_id = None  # 刷新定时器ID
-        self.output_pending = False
         # ===== 设置 shell 的 gui_app 引用 =====
         self.shell.gui_app = self
 
@@ -24960,10 +27386,14 @@ class KIKIGUI(ctk.CTk):
         self._create_terminal_panel()  # 最先 pack，放在最底部
         self._make_dock()  # 最后 pack，放在状态栏上方
         self._start_dock_updates()  # 启动 Dock 栏时钟和电池更新
+        # 启动预览看门狗
+        self._start_preview_watchdog()
         # ===== 注意：原 __init__ 在这里有 self.after_idle(self._init)，我们也把它移到启动画面之后 =====
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.bind("<<CommandDone>>", self._on_command_done)
         self.pet = None
+        # 通知历史（最多保留 200 条）
+        self._notification_history = []
         self._load_persistent()
         self.show_desktop_btn = None
 
@@ -25019,7 +27449,7 @@ class KIKIGUI(ctk.CTk):
         canvas.pack(fill="both", expand=True)
 
         # 硬编码原版 KIKI OS (KIKLAS) ASCII 艺术 Logo
-        logo_text = """
+        logo_text = f"""
     ╔═══════════════════════════════════════════════════════════════╗
     ║                                                               ║
     ║   ██╗  ██╗██╗██╗  ██╗██╗     ██████╗ ███████╗               ║
@@ -25036,7 +27466,7 @@ class KIKIGUI(ctk.CTk):
     ║             ╚██████╔╝███████║                               ║
     ║              ╚═════╝ ╚══════╝                               ║
     ║                                                               ║
-    ║                    KIKI OS v7.0                              ║
+    ║                    KIKI OS v{KIKI_VERSION}                              ║
     ║                                                               ║
     ╚═══════════════════════════════════════════════════════════════╝
         """
@@ -25140,6 +27570,71 @@ class KIKIGUI(ctk.CTk):
         self.after(100, boot_animation)
         # ===== ⭐ 结束 =====
         self.update_idletasks()
+
+    def _open_notification_center(self):
+        win = NotificationCenterWindow(self, self)
+        self._add_window(win)
+
+    def _start_preview_watchdog(self):
+        """周期性检查预览状态。
+        ★ 关键：用 finally 保证不管内部发生什么，都重新调度自己。
+        """
+        if getattr(self, "_closing", False):
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+
+        try:
+            preview_shown = False
+            try:
+                if (hasattr(self, "_taskbar_preview_win")
+                        and self._taskbar_preview_win is not None
+                        and self._taskbar_preview_win.winfo_exists()
+                        and self._taskbar_preview_win.winfo_ismapped()):
+                    preview_shown = True
+            except Exception:
+                pass
+
+            if preview_shown:
+                try:
+                    x, y = self.winfo_pointerxy()
+                    on_preview = False
+                    on_btn = False
+
+                    # 检查是否在预览窗口内
+                    try:
+                        wx1 = self._taskbar_preview_win.winfo_rootx()
+                        wy1 = self._taskbar_preview_win.winfo_rooty()
+                        wx2 = wx1 + self._taskbar_preview_win.winfo_width()
+                        wy2 = wy1 + self._taskbar_preview_win.winfo_height()
+                        on_preview = wx1 <= x <= wx2 and wy1 <= y <= wy2
+                    except Exception:
+                        pass
+
+                    # 检查是否在任意 Dock 按钮上（而不是只看 _preview_source_btn）
+                    on_btn = self._is_pointer_on_any_dock_button(x, y)
+
+                    if not on_preview and not on_btn:
+                        # 直接 withdraw，不再调 _hide_taskbar_preview 的二次校验
+                        try:
+                            self._taskbar_preview_win.withdraw()
+                        except Exception:
+                            pass
+                        self._preview_source_btn = None
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            # ★ 保证无论上面发生什么，都重新调度
+            try:
+                if self.winfo_exists() and not getattr(self, "_closing", False):
+                    self.after(200, self._start_preview_watchdog)
+            except Exception:
+                pass
 
     def _schedule_auto_save(self):
         if self._auto_save_id:
@@ -25673,16 +28168,22 @@ class KIKIGUI(ctk.CTk):
             self.bind_all("<Button-1>", self._close_search_on_click)
 
     def _execute_search_overlay(self, event):
-        """执行搜索操作"""
+        """执行搜索操作（支持 文件/文件夹/命令/别名/插件/应用）"""
         keyword = self.search_input.get().strip()
         if not keyword:
             return
 
-        # 清空旧结果
         for w in self.search_results_list.winfo_children():
             w.destroy()
 
+        # 统一结果格式: (icon, display_name, value, action_type, subtitle)
+        # action_type: "open_path" / "run_command" / "load_plugin" / "install_app"
         results = []
+        kw_lower = keyword.lower()
+
+        # ============================================================
+        # 1. 搜文件/文件夹（原有逻辑）
+        # ============================================================
         search_path = f"/home/{self.username}"
         if not self.shell.fs.resolve(search_path, self.username):
             search_path = "/"
@@ -25694,12 +28195,14 @@ class KIKIGUI(ctk.CTk):
             if not items:
                 return
             for name in items:
-                if keyword.lower() in name.lower():
+                if kw_lower in name.lower():
                     full_path = path + "/" + name if path != "/" else "/" + name
                     node = self.shell.fs.resolve(full_path, self.username)
                     if node:
-                        typ = "📁" if isinstance(node, Directory) else "📄"
-                        results.append((typ, name, full_path))
+                        is_dir = isinstance(node, Directory)
+                        icon = "📁" if is_dir else "📄"
+                        results.append((icon, name, full_path, "open_path",
+                                        "文件夹" if is_dir else "文件"))
                 node = self.shell.fs.resolve(
                     path + "/" + name if path != "/" else "/" + name, self.username
                 )
@@ -25708,74 +28211,250 @@ class KIKIGUI(ctk.CTk):
 
         search_dir(search_path)
 
+        # ============================================================
+        # 2. 搜命令
+        # ============================================================
+        seen_cmds = set()
+        for cmd_name in self.shell.COMMANDS.keys():
+            if kw_lower in cmd_name.lower() and cmd_name not in seen_cmds:
+                seen_cmds.add(cmd_name)
+                help_text = ""
+                info = self.shell._command_registry.get(cmd_name)
+                if info:
+                    help_key = info[1]
+                    try:
+                        help_text = _(help_key)
+                    except Exception:
+                        help_text = help_key
+                results.append(("⚡", cmd_name, cmd_name, "run_command",
+                                f"命令 · {help_text[:40]}"))
+
+        # ============================================================
+        # 3. 搜别名
+        # ============================================================
+        for alias_name, alias_target in self.shell.aliases.items():
+            if kw_lower in alias_name.lower():
+                results.append(("🔗", alias_name, alias_name, "run_command",
+                                f"别名 → {alias_target}"))
+
+        # ============================================================
+        # 4. 搜插件（KIKI_DATA_DIR/plugins 下的 .py）
+        # ============================================================
+        try:
+            plugins_dir = os.path.join(KIKI_DATA_DIR, "plugins")
+            if os.path.isdir(plugins_dir):
+                loaded_plugins = set()
+                if hasattr(self.shell, "plugin_manager") and self.shell.plugin_manager:
+                    loaded_plugins = set(self.shell.plugin_manager.plugins.keys())
+
+                for fname in sorted(os.listdir(plugins_dir)):
+                    if not fname.endswith(".py") or fname.startswith("_"):
+                        continue
+                    plugin_name = fname[:-3]
+                    if kw_lower not in plugin_name.lower():
+                        continue
+                    status = "已加载" if plugin_name in loaded_plugins else "未加载"
+                    action = "run_command" if plugin_name in loaded_plugins else "load_plugin"
+                    results.append(("🔌", plugin_name, plugin_name, action,
+                                    f"插件 · {status}"))
+        except Exception as e:
+            logging.error(f"搜索插件失败: {e}")
+
+        # ============================================================
+        # 5. 搜应用（VFS /home/{user}/apps/ 和宿主机 apps/）
+        # ============================================================
+        try:
+            installed_apps = set(getattr(self.shell, "installed_apps", []))
+            seen_apps = set()
+
+            # 5a. VFS 应用
+            apps_vfs_path = f"/home/{self.username}/apps"
+            apps_node = self.shell.fs.resolve(apps_vfs_path, self.username)
+            if isinstance(apps_node, Directory):
+                for name in apps_node._children.keys():
+                    if kw_lower in name.lower():
+                        seen_apps.add(name)
+                        status = "已安装" if name in installed_apps else "未安装"
+                        action = "run_command" if name in installed_apps else "install_app"
+                        results.append(("📦", name, name, action, f"应用 · {status}"))
+
+            # 5b. 宿主机 apps/
+            host_apps_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apps")
+            if os.path.isdir(host_apps_dir):
+                for name in sorted(os.listdir(host_apps_dir)):
+                    if kw_lower not in name.lower() or name in seen_apps:
+                        continue
+                    if not os.path.isdir(os.path.join(host_apps_dir, name)):
+                        continue
+                    status = "已安装" if name in installed_apps else "未安装"
+                    action = "run_command" if name in installed_apps else "install_app"
+                    results.append(("📦", name, name, action, f"应用 · {status}"))
+        except Exception as e:
+            logging.error(f"搜索应用失败: {e}")
+
+        # ============================================================
+        # 展示结果
+        # ============================================================
         if not results:
             ctk.CTkLabel(
                 self.search_results_list,
-                text="未找到匹配的文件或文件夹",
+                text="未找到匹配的文件、命令、插件或应用",
                 text_color="#666",
                 font=("Arial", 11),
             ).pack(pady=10)
-        else:
-            for typ, name, path in results[:20]:
-                item_frame = ctk.CTkFrame(self.search_results_list, fg_color="transparent")
-                item_frame.pack(fill="x", padx=5, pady=1)
+            return
 
-                label = ctk.CTkLabel(
-                    item_frame, text=f"{typ} {name}", anchor="w", font=("Arial", 11)
-                )
-                label.pack(side="left", fill="x", expand=True)
+        # 命令/插件/应用优先，文件靠后
+        priority = {"run_command": 0, "load_plugin": 1, "install_app": 2, "open_path": 3}
+        results.sort(key=lambda r: (priority.get(r[3], 9), r[1].lower()))
 
-                btn_frame = ctk.CTkFrame(item_frame, fg_color="transparent")
-                btn_frame.pack(side="right")
+        for icon, name, value, action_type, subtitle in results[:30]:
+            item_frame = ctk.CTkFrame(self.search_results_list, fg_color="transparent")
+            item_frame.pack(fill="x", padx=5, pady=1)
 
-                def open_res(p=path):
+            label = ctk.CTkLabel(
+                item_frame, text=f"{icon} {name}", anchor="w", font=("Arial", 11)
+            )
+            label.pack(side="left", fill="x", expand=False)
+
+            sub_label = ctk.CTkLabel(
+                item_frame, text=subtitle, anchor="w",
+                font=("Arial", 9), text_color="#888",
+            )
+            sub_label.pack(side="left", fill="x", expand=True, padx=(10, 5))
+
+            btn_frame = ctk.CTkFrame(item_frame, fg_color="transparent")
+            btn_frame.pack(side="right")
+
+            btn_text = {
+                "open_path": "打开",
+                "run_command": "执行",
+                "load_plugin": "加载",
+                "install_app": "安装",
+            }.get(action_type, "打开")
+
+            def make_action(v=value, at=action_type):
+                def do_action():
                     self.search_overlay.place_forget()
                     for w in self.search_results_list.winfo_children():
                         w.destroy()
                     self.unbind_all("<Button-1>")
+                    self._do_search_action(at, v)
+                return do_action
 
-                    def do_open():
-                        try:
-                            normalized = self.shell.fs._resolve(p)
-                            node = self.shell.fs.resolve(normalized, self.username)
-                            if isinstance(node, Directory):
-                                self._open_fm_at(normalized)
-                            else:
-                                self._open_editor_with_file(normalized)
-                        except Exception as e:
-                            self._print(f"打开文件失败: {e}\n")
+            action_btn = ctk.CTkButton(
+                btn_frame, text=btn_text, width=54, height=22, command=make_action()
+            )
+            action_btn.pack(side="left", padx=2)
 
-                    self.after(50, do_open)
+            if action_type == "open_path":
+                def make_loc(p=value):
+                    def open_location():
+                        self.search_overlay.place_forget()
+                        for w in self.search_results_list.winfo_children():
+                            w.destroy()
+                        self.unbind_all("<Button-1>")
 
-                open_btn = ctk.CTkButton(
-                    btn_frame, text="打开", width=50, height=22, command=open_res
-                )
-                open_btn.pack(side="left", padx=2)
+                        def do_open_loc():
+                            try:
+                                node = self.shell.fs.resolve(p, self.username)
+                                if isinstance(node, Directory):
+                                    parent_dir = p
+                                else:
+                                    parent_dir = os.path.dirname(p) if not p.endswith("/") else p
+                                parent_normalized = self.shell.fs._resolve(parent_dir)
+                                self._open_fm_at(parent_normalized)
+                            except Exception as e:
+                                self._print(f"打开所在位置失败: {e}\n")
 
-                def open_location(p=path):
-                    self.search_overlay.place_forget()
-                    for w in self.search_results_list.winfo_children():
-                        w.destroy()
-                    self.unbind_all("<Button-1>")
-
-                    def do_open_loc():
-                        try:
-                            node = self.shell.fs.resolve(p, self.username)
-                            if isinstance(node, Directory):
-                                parent_dir = p
-                            else:
-                                parent_dir = os.path.dirname(p) if not p.endswith("/") else p
-                            parent_normalized = self.shell.fs._resolve(parent_dir)
-                            self._open_fm_at(parent_normalized)
-                        except Exception as e:
-                            self._print(f"打开所在位置失败: {e}\n")
-
-                    self.after(50, do_open_loc)
+                        self.after(50, do_open_loc)
+                    return open_location
 
                 loc_btn = ctk.CTkButton(
-                    btn_frame, text="📂", width=30, height=22, command=open_location
+                    btn_frame, text="📂", width=30, height=22, command=make_loc()
                 )
                 loc_btn.pack(side="left", padx=2)
+
+    def _do_search_action(self, action_type, value):
+        """执行搜索结果的点击动作。"""
+        try:
+            if action_type == "open_path":
+                normalized = self.shell.fs._resolve(value)
+                node = self.shell.fs.resolve(normalized, self.username)
+                if isinstance(node, Directory):
+                    self._open_fm_at(normalized)
+                elif isinstance(node, File):
+                    self._open_editor_with_file(normalized)
+                else:
+                    self._print(f"❌ 无法打开: {value}\n")
+
+            elif action_type == "run_command":
+                self._run_command_in_terminal(value)
+
+            elif action_type == "load_plugin":
+                self._run_command_in_terminal(f"plugin load {value}")
+
+            elif action_type == "install_app":
+                self._run_command_in_terminal(f"store install {value}")
+
+            else:
+                self._print(f"❌ 未知动作: {action_type}\n")
+        except Exception as e:
+            self._print(f"❌ 执行搜索动作失败: {e}\n")
+
+    def _run_command_in_terminal(self, cmd_line):
+        """在终端里执行一条命令（终端没打开就自动打开）"""
+        try:
+            # ===== 1. 确保有终端存在并可见 =====
+            terminal_visible = False
+
+            # 情况 A：悬浮终端窗口存在且可见
+            if (hasattr(self, "terminal_window")
+                    and self.terminal_window is not None
+                    and self.terminal_window.winfo_exists()
+                    and self.terminal_window.winfo_ismapped()):
+                terminal_visible = True
+                try:
+                    self.terminal_window.lift()
+                    self.terminal_window.focus_force()
+                except Exception:
+                    pass
+
+            # 情况 B：底部终端面板可见
+            if not terminal_visible and hasattr(self, "terminal_frame") \
+                    and self.terminal_frame.winfo_exists() \
+                    and self.terminal_frame.winfo_ismapped():
+                terminal_visible = True
+                try:
+                    self.terminal_frame.lift()
+                except Exception:
+                    pass
+
+            # 情况 C：都没有 → 自动打开悬浮终端
+            if not terminal_visible:
+                self._open_floating_terminal()
+                try:
+                    self.update_idletasks()
+                except Exception:
+                    pass
+
+            # ===== 2. 在终端显示命令 =====
+            if hasattr(self, "term") and self.term is not None \
+                    and self.term.winfo_exists():
+                self.term.configure(state="normal")
+                self.term.insert("end", f"\n{self.shell.get_prompt()}{cmd_line}\n")
+                self.term.see("end")
+                self.term.configure(state="disabled")
+
+            # ===== 3. 执行命令 =====
+            self._exec_cmd(cmd_line)
+
+            # ===== 4. 聚焦输入框 =====
+            if hasattr(self, "entry") and self.entry is not None \
+                    and self.entry.winfo_exists():
+                self.entry.focus_set()
+        except Exception as e:
+            self._print(f"❌ 执行命令失败: {e}\n")
 
     def _close_search_on_click(self, event):
         """精准判断点击区域，避免干扰输入框原生点击"""
@@ -26142,24 +28821,40 @@ class KIKIGUI(ctk.CTk):
 
     def _create_desktop_icons(self):
         """创建桌面图标：固定图标 + 动态快捷方式"""
+        # ========== 1. 销毁旧控件（同步刷新） ==========
         for child in self.icon_frame.winfo_children():
-            child.destroy()
+            try:
+                child.destroy()
+            except Exception:
+                pass
         self.desktop_icons.clear()
         self.desktop_icon_positions.clear()
+        self.desktop_icon_names = {}
 
+        # ★ 强制 tkinter 处理销毁队列，避免旧控件残留
+        try:
+            self.icon_frame.update_idletasks()
+        except Exception:
+            pass
+
+        # ========== 2. 清空 VFS 缓存，确保读到新用户的配置 ==========
+        try:
+            self.shell.fs._node_cache.clear()
+            self.shell.fs._perm_cache.clear()
+        except Exception:
+            pass
+
+        # ========== 3. 从新用户配置里读取图标信息 ==========
         if self.username:
             try:
                 config_content = self.shell.fs.read_file(
-                    f"/home/{self.username}/.kiki-config", self.username
+                    f"/home/{self.username}/.kiki-config", "root"
                 )
                 if config_content:
                     user_config = json.loads(config_content)
                     desktop_config = user_config.get("desktop", {})
                     self.desktop_icon_names = desktop_config.get("icon_names", {})
                     self.desktop_icon_positions = desktop_config.get("icon_positions", {})
-                else:
-                    self.desktop_icon_names = {}
-                    self.desktop_icon_positions = {}
             except Exception:
                 self.desktop_icon_names = {}
                 self.desktop_icon_positions = {}
@@ -27384,6 +30079,8 @@ class KIKIGUI(ctk.CTk):
                 ("系统监控", self._open_system_monitor),
                 ("工作区", self._open_workspace),
                 ("应用商店", self._open_store_gui),  # 新增
+                ("👥 用户管理", self._open_user_manager),
+                ("🔔 通知大厅", self._open_notification_center),
             ],
             "工具": [
                 ("文件管理器", self._open_fm),
@@ -27440,6 +30137,12 @@ class KIKIGUI(ctk.CTk):
     def _open_store_gui(self):
         """打开应用商店 GUI"""
         win = AppStoreWindow(self, self.shell)
+        self._add_window(win)
+
+    def _open_user_manager(self):
+        if self.username is None:
+            return
+        win = UserManagerWindow(self, self.shell)
         self._add_window(win)
 
     def _show_menu(self, btn, items):
@@ -27610,6 +30313,20 @@ class KIKIGUI(ctk.CTk):
             command=self._toggle_volume,
         )
         self.vol_btn.pack(side="left", padx=2)
+
+        self.notif_btn = ctk.CTkButton(
+            self.dock_right,
+            text="🔔",
+            width=24,
+            height=24,
+            corner_radius=6,
+            fg_color="transparent",
+            text_color="#cccccc",
+            hover_color="#3a3a42",
+            font=("Segoe UI Emoji", 11),
+            command=self._open_notification_center,
+        )
+        self.notif_btn.pack(side="left", padx=2)
 
         self.show_desktop_btn = ctk.CTkButton(
             self.dock_right,
@@ -28265,69 +30982,157 @@ class KIKIGUI(ctk.CTk):
 
         def do_login():
             nonlocal logged_in
+            import time as _t
+            import os as _os
+
             user = user_entry.get().strip().lower()
             pwd = pwd_entry.get()
             if not user or not pwd:
                 error_label.configure(text="请输入用户名和密码")
                 return
 
+            # ============ 诊断日志：写文件 ============
+            LOG_PATH = _os.path.join(_os.path.expanduser("~"), "kiki_login_debug.log")
+
+            def _log(msg):
+                try:
+                    with open(LOG_PATH, "a", encoding="utf-8") as f:
+                        f.write(f"{_t.strftime('%H:%M:%S')} {msg}\n")
+                except Exception:
+                    pass
+
+            def _lap(label, start):
+                now = _t.time()
+                _log(f"[LOGIN] {label}: {now - start:.3f}s")
+                return now
+
+            # 清空旧日志
+            try:
+                if _os.path.exists(LOG_PATH):
+                    _os.remove(LOG_PATH)
+            except Exception:
+                pass
+
+            _log("=" * 50)
+            _log("[LOGIN] ===== 开始登录 =====")
+            T = _t.time()
+
             shell = self.shell
             with shell._lock:
                 if user in shell.users and verify_password(shell.users[user], pwd):
+
                     self.username = user
-                    # 启动 REST API 服务（仅启动一次）
+                    T = _lap("① 设置用户名", T)
+
+                    # REST API（只启动一次）
                     if not hasattr(self, "_rest_server"):
                         try:
                             from http.server import HTTPServer
-
                             self._rest_server = HTTPServer(("", 8080), RESTHandler)
                             RESTHandler.server_instance = self
                             threading.Thread(
                                 target=self._rest_server.serve_forever, daemon=True
                             ).start()
-                            self._print(
-                                "REST API 服务已启动，访问 http://localhost:8080 查看控制面板\n"
-                            )
+                            self._print("REST API 服务已启动，访问 http://localhost:8080 查看控制面板\n")
                         except Exception as e:
                             self._print(f"REST API 启动失败: {e}\n")
+                    T = _lap("② REST API", T)
+
+                    # Notes 目录
                     notes_path = f"/home/{user}/Notes"
                     if not self.shell.fs.resolve(notes_path, user):
                         self.shell.fs.mkdir(notes_path, user)
+                    T = _lap("③ Notes 目录", T)
+
                     shell.username = user
                     home = f"/home/{user}"
                     shell.fs.cwd = shell.fs.resolve(home, user)
+                    T = _lap("④ 设置 cwd", T)
+
                     shell._load_user_env()
+                    T = _lap("⑤ 加载环境变量", T)
+
                     shell.apply_config()
+                    T = _lap("⑥ 应用配置", T)
+
                     shell.fs._audit(f"GUI_LOGIN {user}", user)
+                    T = _lap("⑦ 审计日志", T)
+
                     shell.gui_app = self
-                    self.after(500, self._create_desktop_icons)  # 延迟500毫秒刷新，避免打断操作
+
+                    # 桌面图标延迟刷新
+                    self.after(500, self._create_desktop_icons)
+
                     logged_in = True
                     login.destroy()
+                    T = _lap("⑧ 关闭登录窗口", T)
+
                     self._update_status()
-                    self._update_wallpaper()
-                    self.plugin_manager.load_all()
+                    T = _lap("⑨ 更新状态栏", T)
+
+                    # 壁纸异步
+                    try:
+                        threading.Thread(
+                            target=self._update_wallpaper, daemon=True
+                        ).start()
+                    except Exception:
+                        pass
+                    T = _lap("⑩ 触发壁纸更新（异步）", T)
+
+                    # 插件异步
+                    try:
+                        self.after(500, self.plugin_manager.load_all)
+                    except Exception:
+                        pass
+                    T = _lap("⑪ 触发插件加载（异步）", T)
+
                     self.shell.installed_apps = self.shell._load_installed_apps()
+                    T = _lap("⑫ 加载已安装应用列表", T)
+
                     self.shell._load_third_party_apps()
-                    if self.pet is None:
-                        self.pet = Pet(self)
-                    else:
-                        self.pet.window.deiconify()
+                    T = _lap("⑬ 加载第三方应用", T)
+
+                    # 宠物
+                    try:
+                        if self.pet is None:
+                            self.pet = Pet(self)
+                        else:
+                            self.pet.window.deiconify()
+                    except Exception as e:
+                        self._print(f"⚠️ 宠物创建失败: {e}\n")
+                    T = _lap("⑭ 宠物", T)
+
                     motd = shell.fs.read_file("/etc/motd", user)
                     self._print(motd or "欢迎使用 KIKI OS 图形界面！\n输入 help 查看命令。\n")
                     if hasattr(self, "entry") and self.entry and self.entry.winfo_exists():
                         self.entry.focus_set()
+                    T = _lap("⑮ MOTD + 焦点", T)
+
                     self._update_dock()
+                    T = _lap("⑯ 更新 Dock", T)
+
                     self._load_widgets()
+                    T = _lap("⑰ 加载挂件", T)
+
                     self._load_pinned_items()
-                    self._last_prompt_time = time.time()
+                    T = _lap("⑱ 加载固定项", T)
+
+                    self._last_prompt_time = _t.time()
                     self.after(100, self._force_print_initial_prompt)
-                    # 强制恢复 Dock 栏（如果因某种原因被隐藏）
+
+                    # 强制显示 Dock
                     if hasattr(self, "dock_bg") and self.dock_bg.winfo_exists():
                         self.dock_bg.place(relx=0.5, rely=1.0, anchor="s", y=-28)
                         self.dock_bg.lift()
+                    T = _lap("⑲ Dock 定位", T)
+
+                    _log("[LOGIN] ===== 登录完成 =====")
+                    _log("=" * 50)
+
                     return
                 else:
                     error_label.configure(text="用户名或密码错误")
+                    _log("[LOGIN] ❌ 用户名或密码错误")
 
         user_entry.bind("<Return>", lambda e: do_login())
         pwd_entry.bind("<Return>", lambda e: do_login())
@@ -28520,12 +31325,58 @@ class KIKIGUI(ctk.CTk):
             finally:
                 self.game_running = False
                 self._game_stop_flag = False
-                self.event_generate("<<CommandDone>>")
+                # ★ 主线程排一个提示符
+                try:
+                    self.after(200, self._do_print_prompt)
+                except Exception:
+                    pass
 
         threading.Thread(target=run_game, daemon=True).start()
 
-    def _show_notification(self, message, duration=2000):
-        Notification(self, message, duration)
+    def _show_notification(self, message, duration=2000, title="提示", level="info"):
+        """
+        显示通知，同时记录到历史。
+        level: info / warning / error / success
+        """
+        try:
+            import time as _t
+            entry = {
+                "time": _t.strftime("%Y-%m-%d %H:%M:%S"),
+                "title": title,
+                "message": message,
+                "level": level,
+            }
+            self._notification_history.append(entry)
+            if len(self._notification_history) > 200:
+                self._notification_history = self._notification_history[-200:]
+        except Exception:
+            pass
+
+        try:
+            icon_map = {
+                "info": "ℹ️",
+                "warning": "⚠️",
+                "error": "❌",
+                "success": "✅",
+            }
+            icon = icon_map.get(level, "ℹ️")
+            Notification(self, message, duration, icon=icon, title=title)
+        except Exception:
+            pass
+
+    def _show_ai_reply(self, reply, emoji="🤖"):
+        """把 AI 回复打印到终端（当 AI 聊天窗口未打开时的兜底）"""
+        try:
+            self._print(f"{emoji} AI: {reply}\n")
+        except Exception:
+            print(f"AI: {reply}")
+
+    def _show_thinking(self, thinking):
+        """把 AI 思考过程打印到终端"""
+        try:
+            self._print(f"🧠 思考: {thinking}\n")
+        except Exception:
+            print(f"思考: {thinking}")
 
     def _reboot(self):
         import os
@@ -28533,9 +31384,16 @@ class KIKIGUI(ctk.CTk):
         import sys
         import time
 
-        # 打印到原始控制台（启动时所在的命令行窗口）
-        sys.__stdout__.write("===== _reboot 被调用 =====\n")
-        sys.__stdout__.flush()
+        # 安全打印到原始控制台（可能为 None）
+        def _safe_write(text):
+            try:
+                if sys.__stdout__ is not None:
+                    sys.__stdout__.write(text)
+                    sys.__stdout__.flush()
+            except Exception:
+                pass
+
+        _safe_write("===== _reboot 被调用 =====\n")
 
         if not messagebox.askyesno("重启", "确定重启 KIKI OS？"):
             return
@@ -28545,55 +31403,60 @@ class KIKIGUI(ctk.CTk):
         # 构建启动命令
         script = os.path.abspath(sys.argv[0])
         if getattr(sys, "frozen", False):
-            # 如果是打包后的 exe
             cmd = [script]
         else:
-            # 源码运行
             cmd = [sys.executable, script]
 
-        sys.__stdout__.write(f"尝试启动命令: {cmd}\n")
-        sys.__stdout__.flush()
+        _safe_write(f"尝试启动命令: {cmd}\n")
 
         # 尝试启动新进程
         try:
-            # Windows 下创建新控制台，避免被父进程影响
             if sys.platform.startswith("win"):
                 proc = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
             else:
                 proc = subprocess.Popen(cmd, start_new_session=True)
-            sys.__stdout__.write(f"新进程启动成功，PID: {proc.pid}\n")
-            sys.__stdout__.flush()
+            _safe_write(f"新进程启动成功，PID: {proc.pid}\n")
         except Exception as e:
-            sys.__stdout__.write(f"Popen 启动失败: {e}\n")
-            sys.__stdout__.flush()
-            # 备选方案：尝试 os.startfile (Windows)
+            _safe_write(f"Popen 启动失败: {e}\n")
             if sys.platform.startswith("win"):
                 try:
                     os.startfile(script)
-                    sys.__stdout__.write("os.startfile 尝试启动\n")
+                    _safe_write("os.startfile 尝试启动\n")
                 except Exception as e2:
-                    sys.__stdout__.write(f"os.startfile 也失败: {e2}\n")
+                    _safe_write(f"os.startfile 也失败: {e2}\n")
             else:
-                # Unix 备选：用 os.execv
                 try:
                     os.execv(sys.executable, [sys.executable, script])
                 except Exception as e3:
-                    sys.__stdout__.write(f"os.execv 失败: {e3}\n")
+                    _safe_write(f"os.execv 失败: {e3}\n")
 
-        # 为了防止父进程过早退出导致子进程被终止，先睡眠一小会儿
+        # 给子进程一点时间起来
         time.sleep(0.5)
 
-        # 关闭主窗口（但不退出进程，让用户能看到控制台输出）
+        # 关闭主窗口
         self._closing = True
         self.destroy()
 
-        # 暂停，等待用户按 Enter 退出，方便你观察输出
-        sys.__stdout__.write("\n按 Enter 键退出当前进程（新窗口应已启动）...\n")
-        sys.__stdout__.flush()
+        # 只在有真实交互终端时才暂停等待
+        is_interactive = False
         try:
-            input()
+            is_interactive = (
+                sys.__stdout__ is not None
+                and sys.__stdin__ is not None
+                and hasattr(sys.__stdin__, "isatty")
+                and sys.__stdin__.isatty()
+            )
         except Exception:
-            pass
+            is_interactive = False
+
+        if is_interactive:
+            try:
+                sys.__stdout__.write("\n按 Enter 键退出当前进程（新窗口应已启动）...\n")
+                sys.__stdout__.flush()
+                input()
+            except (EOFError, KeyboardInterrupt, Exception):
+                pass
+
         sys.exit(0)
 
     def _shutdown(self):
@@ -28607,7 +31470,7 @@ class KIKIGUI(ctk.CTk):
     def _about(self):
         messagebox.showinfo(
             "关于",
-            "KIKI OS 终极版 v7.0\n完整功能：图形桌面（壁纸图片、图标、右键菜单）、终端、任务栏、通知、持久化、任务管理器、REPL、HTTP服务器、包管理器、多桌面、嵌套Shell、音效、小宠物\n新增：分布式FS、IPC、信号、自定义窗口、浏览器、语音、profile、热重载、SELinux、加密审计、截图（全屏/区域）、宠物语音控制",
+            f"KIKI OS 终极版 v{KIKI_VERSION}\n完整功能：图形桌面（壁纸图片、图标、右键菜单）、终端、任务栏、通知、持久化、任务管理器、REPL、HTTP服务器、包管理器、多桌面、嵌套Shell、音效、小宠物\n新增：分布式FS、IPC、信号、自定义窗口、浏览器、语音、profile、热重载、SELinux、加密审计、截图（全屏/区域）、宠物语音控制",
         )
 
     def _open_fm(self):
@@ -28679,36 +31542,62 @@ class KIKIGUI(ctk.CTk):
         self._add_window(win)
 
     def _open_browser(self, url="https://www.baidu.com"):
-        """打开浏览器：优先 Qt，失败则回退到 tkinterweb"""
+        """打开浏览器：先做能力检查，优先 Qt，其次 tkinterweb，都不可用则弹窗提示"""
 
-        # ===== 1. 尝试 Qt（PyQt5/PySide6） =====
-        try:
-            win = QtTabBrowserWindow(
-                self, url=url, gui_app=self, shell=self.shell, username=self.username
+        # ========== 1) Qt 完整可用 ==========
+        if QT_LIB and HAS_QTWEBENGINE and HAS_QTWEBENGINE_ADDONS:
+            try:
+                win = QtTabBrowserWindow(
+                    self, url=url, gui_app=self, shell=self.shell, username=self.username
+                )
+                self._add_window(win)
+                return
+            except Exception as e:
+                self._show_notification(
+                    f"Qt 浏览器启动失败：{e}\n已尝试回退到轻量引擎。",
+                    duration=5000, title="浏览器", level="warning",
+                )
+
+        # ========== 2) Qt 装了但不完整 ==========
+        elif QT_LIB:
+            self._show_notification(
+                f"{QT_LIB} 已安装，但 QtWebEngine 附加组件缺失。\n"
+                f"PyQt5: pip install PyQtWebEngine\n"
+                f"PySide6: pip install PySide6-Addons\n"
+                f"正在回退到 tkinterweb 轻量浏览器。",
+                duration=6000, title="浏览器组件缺失", level="warning",
             )
-            self._add_window(win)
-            return
-        except Exception as e:
-            self._print(f"⚠️ Qt 浏览器启动失败（{e}），回退到 tkinterweb\n")
 
-        # ===== 2. 尝试 tkinterweb =====
+        # ========== 3) 尝试 tkinterweb 兜底 ==========
         if HAS_WEBVIEW:
             try:
                 win = WebBrowserWindow(
-                    self,
-                    url=url,
-                    gui_app=self,
-                    shell=self.shell,
-                    username=self.username,
+                    self, url=url, gui_app=self, shell=self.shell, username=self.username,
                 )
                 self._add_window(win)
-                self._print("📌 使用 tkinterweb 引擎（轻量级）\n")
+                self._show_notification(
+                    "已使用 tkinterweb 轻量浏览器（功能有限）。",
+                    duration=3000, title="浏览器", level="info",
+                )
                 return
             except Exception as e:
-                self._print(f"⚠️ tkinterweb 加载失败: {e}\n")
+                self._show_notification(
+                    f"tkinterweb 加载失败：{e}",
+                    duration=5000, title="浏览器", level="error",
+                )
 
-        # ===== 3. 都失败了，提示用户 =====
-        self._show_notification("❌ 没有可用的浏览器引擎，请安装 PyQt5 或 tkinterweb")
+        # ========== 4) 全都没有 ==========
+        messagebox.showerror(
+            "无可用的浏览器引擎",
+            f"{browser_engine_status()}\n\n"
+            f"请安装以下任一方案：\n"
+            f"  pip install PyQt5 PyQtWebEngine\n"
+            f"  或\n"
+            f"  pip install tkinterweb"
+        )
+        self._show_notification(
+            "无可用浏览器引擎", duration=3000, title="浏览器", level="error",
+        )
 
     def _open_paint(self):
         win = PaintApp(self, self.shell, self.username)
@@ -28954,6 +31843,15 @@ class KIKIGUI(ctk.CTk):
     def _update_dock(self):
         """刷新 Dock 栏（回退到 CTkButton，禁用原生悬停 + 手动控制颜色）"""
         try:
+            self._cancel_hide_preview()
+            if hasattr(self, "_taskbar_preview_win") and self._taskbar_preview_win is not None:
+                if self._taskbar_preview_win.winfo_exists():
+                    self._taskbar_preview_win.withdraw()
+            self._preview_source_btn = None
+        except Exception:
+            pass
+
+        try:
             if not hasattr(self, "dock_bg") or not self.dock_bg.winfo_exists():
                 self._make_dock()
             else:
@@ -29113,6 +32011,9 @@ class KIKIGUI(ctk.CTk):
         # 取消之前的隐藏计划
         self._cancel_hide_preview()
 
+        # ★ 记录触发按钮，供位置校验
+        self._preview_source_btn = btn
+
         # 创建或复用预览窗口
         if not hasattr(self, "_taskbar_preview_win") or self._taskbar_preview_win is None or not self._taskbar_preview_win.winfo_exists():
             self._taskbar_preview_win = ctk.CTkToplevel(self)
@@ -29183,12 +32084,6 @@ class KIKIGUI(ctk.CTk):
                 pass
             self._hide_preview_after_id = None
 
-    def _hide_taskbar_preview(self):
-        """真正隐藏预览"""
-        # 取消隐藏计划
-        self._cancel_hide_preview()
-        if hasattr(self, "_taskbar_preview_win") and self._taskbar_preview_win is not None and self._taskbar_preview_win.winfo_exists():
-            self._taskbar_preview_win.withdraw()
 
     def _capture_window_via_printwindow(self, window):
         """使用 PrintWindow 捕获窗口自身内容（仅 Windows）"""
@@ -29732,17 +32627,75 @@ class KIKIGUI(ctk.CTk):
             self._show_notification(f"已固定: {display_name}")
 
     def _hide_taskbar_preview(self):
-        """隐藏预览"""
-        # 取消防抖定时器，防止延迟显示
-        if hasattr(self, "_preview_after_id") and self._preview_after_id:
+        """隐藏预览。移除了对 _preview_source_btn 的单一依赖，
+        改为检查鼠标是否在任意 Dock 按钮上，避免过期引用导致误判。
+        """
+        # 1. 取消防抖定时器
+        self._cancel_hide_preview()
+
+        # 2. 预览窗口不存在 → 直接清引用
+        if not hasattr(self, "_taskbar_preview_win") or self._taskbar_preview_win is None:
+            self._preview_source_btn = None
+            return
+        try:
+            if not self._taskbar_preview_win.winfo_exists():
+                self._preview_source_btn = None
+                return
+            if not self._taskbar_preview_win.winfo_ismapped():
+                self._preview_source_btn = None
+                return
+        except Exception:
+            self._preview_source_btn = None
+            return
+
+        # 3. 检查鼠标位置
+        try:
+            x, y = self.winfo_pointerxy()
+
+            # 3.1 在预览窗口内 → 不隐藏
             try:
-                self.after_cancel(self._preview_after_id)
+                wx1 = self._taskbar_preview_win.winfo_rootx()
+                wy1 = self._taskbar_preview_win.winfo_rooty()
+                wx2 = wx1 + self._taskbar_preview_win.winfo_width()
+                wy2 = wy1 + self._taskbar_preview_win.winfo_height()
+                if wx1 <= x <= wx2 and wy1 <= y <= wy2:
+                    return
             except Exception:
                 pass
-            self._preview_after_id = None
-        # 隐藏预览窗口
-        if hasattr(self, "_taskbar_preview_win") and self._taskbar_preview_win is not None and self._taskbar_preview_win.winfo_exists():
+
+            # 3.2 在任意 Dock 按钮上 → 不隐藏
+            if self._is_pointer_on_any_dock_button(x, y):
+                return
+        except Exception:
+            pass
+
+        # 4. 隐藏
+        try:
             self._taskbar_preview_win.withdraw()
+        except Exception:
+            pass
+        self._preview_source_btn = None
+
+    def _is_pointer_on_any_dock_button(self, x, y):
+        """检查屏幕坐标 (x, y) 是否落在任意 Dock 按钮上。"""
+        try:
+            if not hasattr(self, "dock_left") or not self.dock_left.winfo_exists():
+                return False
+            for child in self.dock_left.winfo_children():
+                try:
+                    if not child.winfo_exists():
+                        continue
+                    bx1 = child.winfo_rootx()
+                    by1 = child.winfo_rooty()
+                    bx2 = bx1 + child.winfo_width()
+                    by2 = by1 + child.winfo_height()
+                    if bx1 <= x <= bx2 and by1 <= y <= by2:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
 
     def _save_pinned_items(self):
         """保存固定列表到配置"""
@@ -30201,6 +33154,7 @@ class PythonREPL(KikiWindow):
         self.shell = shell
         self.history = []
         self.history_idx = 0
+        self._current_proc = None
         self._create_widgets()
         self._bind_repl_events()
         self._print_banner()
@@ -30218,6 +33172,26 @@ class PythonREPL(KikiWindow):
             self.content_frame, text="执行 (Ctrl+Enter)", command=self._execute
         )
         self.exec_btn.pack(pady=(0, 5))
+        self.stop_btn = ctk.CTkButton(
+            self.content_frame,
+            text="⏹ 停止",
+            command=self._force_stop,
+            fg_color="#cc0000",
+            hover_color="#aa0000",
+        )
+        self.stop_btn.pack(pady=(0, 5))
+
+    def _force_stop(self):
+        """强制终止当前正在运行的子进程。"""
+        p = getattr(self, "_current_proc", None)
+        if p is None or not p.is_alive():
+            self._print("（当前没有正在运行的进程）\n")
+            return
+        try:
+            p.terminate()
+        except Exception:
+            pass
+        self._print("⏹ 已发送终止信号\n")
 
     def _bind_repl_events(self):
         self.input_box.bind("<Control-Return>", self._execute)
@@ -30252,31 +33226,70 @@ class PythonREPL(KikiWindow):
         self.history_idx = len(self.history)
         self._print(f">>> {code}\n")
 
+        # 禁用按钮，防止用户连点
+        try:
+            self.exec_btn.configure(state="disabled", text="执行中...")
+        except Exception:
+            pass
+
+        self._print("⏳ 沙盒执行中...\n")
+
         import multiprocessing
+        import threading
 
         output_queue = multiprocessing.Queue()
-        p = multiprocessing.Process(target=_repl_sandbox_target, args=(code, output_queue))
+        p = multiprocessing.Process(
+            target=_repl_sandbox_target,
+            args=(code, output_queue),
+            daemon=True,
+        )
         p.start()
-        p.join(timeout=60)
+        self._current_proc = p   # ← 加这一行
 
-        output = ""
-        error = ""
-        if not output_queue.empty():
-            msg = output_queue.get()
-            if msg[0] == "result":
-                output = msg[1]
-                error = msg[2]
-            elif msg[0] == "exception":
-                error = msg[1]
+        # ★ 关键：后台线程等子进程，主线程不阻塞
+        def wait_worker():
+            p.join(timeout=60)
 
-        if p.is_alive():
-            p.terminate()
-            p.join()
-            error += "\n⚠️ 沙盒执行超时，已被强制终止。"
+            if p.is_alive():
+                # 超时 → 强制终止
+                p.terminate()
+                p.join(timeout=2)
+                if p.is_alive():
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                out_text = ""
+                err_text = "⚠️ 沙盒执行超时（60秒），已被强制终止。"
+            else:
+                out_text = ""
+                err_text = ""
+                # Queue.empty() 不可靠，直接 get_nowait + 异常兜底
+                try:
+                    msg = output_queue.get_nowait()
+                    if msg[0] == "result":
+                        out_text = msg[1]
+                        err_text = msg[2]
+                    elif msg[0] == "exception":
+                        err_text = msg[1]
+                except Exception:
+                    pass
 
+            # 回主线程更新 UI
+            try:
+                self.after(0, lambda: self._on_exec_done(out_text, err_text))
+            except Exception:
+                pass
+
+        threading.Thread(target=wait_worker, daemon=True).start()
+        return "break"
+
+    def _on_exec_done(self, output, error):
+        """子进程结束后，主线程回调：刷新 UI、恢复按钮。"""
+        if not self.winfo_exists():
+            return
         if output:
             self._print(output)
-            # 确保输出后有一个换行，避免提示符与输出在同一行
             if not output.endswith("\n"):
                 self._print("\n")
         if error:
@@ -30284,7 +33297,11 @@ class PythonREPL(KikiWindow):
             if not error.endswith("\n"):
                 self._print("\n")
         self._print(">>> ")
-        return "break"
+        try:
+            self.exec_btn.configure(state="normal", text="执行 (Ctrl+Enter)")
+        except Exception:
+            pass
+        self._current_proc = None
 
     def _history_up(self, event):
         if self.history_idx > 0:
@@ -31842,7 +34859,7 @@ class StickyNote(ctk.CTkToplevel):
 
 class AIChatWindow(KikiWindow):
     def __init__(self, master, shell):
-        super().__init__(master, title="AI 助手（文本输入）", width=650, height=550)
+        super().__init__(master, title="AI 助手（文本输入）", width=650, height=580)
         self.gui = master
         self.shell = shell
         self.ai_engine = shell.ai_engine
@@ -31850,26 +34867,46 @@ class AIChatWindow(KikiWindow):
         self.ai_engine.reply_callback = self._show_ai_reply
         self.ai_engine.thinking_callback = self._show_thinking
 
+        # ============ 状态 + 模型选择 ============
         status_frame = ctk.CTkFrame(self.content_frame, fg_color="transparent")
         status_frame.pack(fill="x", padx=10, pady=5)
+
         self.status_label = ctk.CTkLabel(status_frame, text="", font=("Arial", 10))
-        self.status_label.pack(side="left")
-        self.refresh_model_btn = ctk.CTkButton(status_frame, text="刷新模型", width=70, command=self.refresh_model)
-        self.refresh_model_btn.pack(side="right")
+        self.status_label.pack(side="left", padx=(0, 10))
+
+        # ★ 模型下拉框（仅当有多个模型时显示）
+        self.model_combo = None
+        self.model_var = None
+        self._build_model_selector(status_frame)
+
+        self.refresh_model_btn = ctk.CTkButton(
+            status_frame, text="刷新", width=50, command=self.refresh_model
+        )
+        self.refresh_model_btn.pack(side="right", padx=(5, 0))
+
         self.speak_btn = ctk.CTkCheckBox(status_frame, text="语音朗读", command=self.toggle_speak)
         self.speak_btn.pack(side="right", padx=10)
 
+        # ============ 思考区 ============
         self.think_frame = ctk.CTkFrame(self.content_frame, fg_color="#1a1a2e")
         self.think_frame.pack(fill="x", padx=10, pady=5)
-        self.think_display = ctk.CTkTextbox(self.think_frame, height=80, font=("Courier New", 10), state="disabled")
+        self.think_display = ctk.CTkTextbox(
+            self.think_frame, height=80, font=("Courier New", 10), state="disabled"
+        )
         self.think_display.pack(fill="both", expand=True)
-        self.think_toggle_btn = ctk.CTkButton(self.think_frame, text="🧠 思考过程 ▲", command=self.toggle_thinking)
+        self.think_toggle_btn = ctk.CTkButton(
+            self.think_frame, text="🧠 思考过程 ▲", command=self.toggle_thinking
+        )
         self.think_toggle_btn.pack(side="bottom")
         self.think_visible = True
 
-        self.chat_display = ctk.CTkTextbox(self.content_frame, font=("Courier New", 11), wrap="word", state="disabled")
+        # ============ 聊天显示 ============
+        self.chat_display = ctk.CTkTextbox(
+            self.content_frame, font=("Courier New", 11), wrap="word", state="disabled"
+        )
         self.chat_display.pack(fill="both", expand=True, padx=10, pady=5)
 
+        # ============ 输入区 ============
         input_frame = ctk.CTkFrame(self.content_frame, fg_color="transparent")
         input_frame.pack(fill="x", padx=10, pady=5)
         self.input_entry = ctk.CTkEntry(input_frame, placeholder_text="输入问题...")
@@ -31879,20 +34916,264 @@ class AIChatWindow(KikiWindow):
         self.send_btn.pack(side="right")
 
         self.speak_enabled = False
-        self.refresh_model()
-        # 初始化后自动询问是否启用在线模型（若已发现但未决定）
-        if self.ai_engine._model_user_choice is None:
-            self.ai_engine._try_enable_model_sync()
-        self.chat_display.insert("end", "欢迎使用 AI 助手（已整合思考与工具）！\n")
+
+        # 欢迎信息先显示
+        self.chat_display.insert("end", "欢迎使用 AI 助手！\n")
         self.chat_display.configure(state="disabled")
 
+        # ★ 所有网络 / 弹窗操作都延迟到窗口渲染完之后
+        self.after(100, self._initial_model_setup)
+
+    def _initial_model_setup(self):
+        """窗口渲染完后再做的初始化。★ 只做异步检测，绝不弹窗。"""
+        # 只调异步刷新，不碰 _try_enable_model_sync
+        self.refresh_model()
+
+    # ---------- 模型下拉框构建 ----------
+    def _build_model_selector(self, parent):
+        """构建模型下拉框。选项包含：离线 / 在线AI / 本地 Ollama 模型。"""
+        options, default = self._collect_model_options()
+
+        # 移除旧的下拉框和提示（如果已存在）
+        try:
+            if getattr(self, "model_combo", None) is not None:
+                if self.model_combo.winfo_exists():
+                    self.model_combo.destroy()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_no_model_label") and self._no_model_label.winfo_exists():
+                self._no_model_label.destroy()
+        except Exception:
+            pass
+
+        ctk.CTkLabel(parent, text="模型:", font=("Arial", 10)).pack(side="left", padx=(5, 2))
+
+        self.model_var = ctk.StringVar(value=default)
+        self.model_combo = ctk.CTkComboBox(
+            parent,
+            values=options,
+            variable=self.model_var,
+            command=self._on_model_change,
+            width=240,
+            font=("Arial", 10),
+        )
+        self.model_combo.pack(side="left", padx=2)
+
+    def _collect_model_options(self):
+        """收集所有可选项，返回 (选项列表, 默认选中项)。"""
+        options = ["📴 离线模式"]
+
+        # 在线 AI（仅当配置齐全时出现）
+        try:
+            base_url = (self.shell.config.get("ai.base_url", "") or "").strip()
+            api_key = (self.shell.config.get("ai.api_key", "") or "").strip()
+            provider = self.shell.config.get("ai.provider", "mock")
+            if provider not in ("mock", "ollama", "") and base_url and api_key:
+                online_model = (self.shell.config.get("ai.model", "") or "").strip()
+                label = f"🌐 在线 AI ({provider}"
+                if online_model:
+                    label += f" / {online_model}"
+                label += ")"
+                options.append(label)
+        except Exception:
+            pass
+
+        # 本地 Ollama 模型
+        try:
+            text_models = self.ai_engine.get_text_models() or []
+        except Exception:
+            text_models = []
+        for m in text_models:
+            options.append(f"🖥️ {m}")
+
+        # 决定默认选中
+        default = "📴 离线模式"
+        current_provider = self.ai_engine.provider
+        current_model = self.ai_engine.model
+
+        if current_provider == "ollama" and current_model:
+            cand = f"🖥️ {current_model}"
+            if cand in options:
+                default = cand
+        elif current_provider and current_provider != "ollama":
+            for opt in options:
+                if opt.startswith("🌐 在线 AI"):
+                    default = opt
+                    break
+
+        return options, default
+
+    def _sync_model_selector(self):
+        """刷新下拉框内容（检测到新模型或引擎切换后调用）。"""
+        # 清掉旧的"无模型"提示（新逻辑里我们不再隐藏下拉框）
+        try:
+            if hasattr(self, "_no_model_label") and self._no_model_label.winfo_exists():
+                self._no_model_label.destroy()
+        except Exception:
+            pass
+
+        # 下拉框不存在 → 重建
+        if getattr(self, "model_combo", None) is None or not self.model_combo.winfo_exists():
+            parent = self.status_label.master
+            self._build_model_selector(parent)
+            return
+
+        options, default = self._collect_model_options()
+
+        try:
+            self.model_combo.configure(values=options)
+            # 当前选中项不在新列表 → 重置为默认
+            current = self.model_var.get() if self.model_var else ""
+            if current not in options:
+                self.model_var.set(default)
+        except Exception:
+            pass
+
+    def _on_model_change(self, choice):
+        """用户从下拉框选择。choice 是带 emoji 前缀的显示文本。"""
+        if not choice:
+            return
+
+        # ---------- 1. 离线模式 ----------
+        if choice == "📴 离线模式":
+            self.ai_engine.provider = None
+            self.ai_engine.model = None
+            self.ai_engine._model_user_choice = False
+            self.ai_engine.messages = []
+            try:
+                self.ai_engine.clear_history()
+            except Exception:
+                pass
+            try:
+                self.shell.config.set("ai.online_enabled", False, self.shell.username)
+                self.shell.config.save_user_config(self.shell.username)
+            except Exception:
+                pass
+            self.chat_display.configure(state="normal")
+            self.chat_display.insert("end", "📴 已切换到离线模式（规则匹配）\n\n")
+            self.chat_display.configure(state="disabled")
+            self.status_label.configure(text="状态: 离线模式")
+            return
+
+        # ---------- 2. 在线 AI ----------
+        if choice.startswith("🌐 在线 AI"):
+            provider = self.shell.config.get("ai.provider", "openai")
+            model = self.shell.config.get("ai.model", "gpt-3.5-turbo")
+            self.ai_engine.provider = provider
+            self.ai_engine.model = model
+            self.ai_engine._model_user_choice = True
+            self.ai_engine.messages = []
+            try:
+                self.ai_engine.clear_history()
+            except Exception:
+                pass
+            try:
+                self.shell.config.set("ai.online_enabled", True, self.shell.username)
+                self.shell.config.save_user_config(self.shell.username)
+            except Exception:
+                pass
+            self.chat_display.configure(state="normal")
+            self.chat_display.insert("end", f"🌐 已切换到在线 AI: {provider} / {model}\n\n")
+            self.chat_display.configure(state="disabled")
+            self.status_label.configure(text=f"状态: 在线（{provider}）| 模型: {model}")
+            return
+
+        # ---------- 3. 本地 Ollama 模型 ----------
+        if choice.startswith("🖥️ "):
+            model_name = choice[2:].strip()
+            if not model_name:
+                return
+            self.ai_engine.model = model_name
+            self.ai_engine.provider = "ollama"
+            self.ai_engine._model_user_choice = True
+            self.ai_engine.messages = []
+            try:
+                self.ai_engine.clear_history()
+            except Exception:
+                pass
+            try:
+                self.shell.config.set("ai.model", model_name, self.shell.username)
+                self.shell.config.set("ai.online_enabled", True, self.shell.username)
+                self.shell.config.save_user_config(self.shell.username)
+            except Exception:
+                pass
+            self.chat_display.configure(state="normal")
+            self.chat_display.insert("end", f"🔄 已切换到模型: {model_name}\n\n")
+            self.chat_display.configure(state="disabled")
+            self.status_label.configure(text=f"状态: 在线（Ollama）| 模型: {model_name}")
+            return
+
+    # ---------- 原有方法保持 ----------
     def refresh_model(self):
-        self.ai_engine.detect_local_ollama()
-        # 如果检测到模型但用户还没选择，弹出询问
-        if self.ai_engine._model_user_choice is None and self.ai_engine.available_models:
-            self.ai_engine._try_enable_model_sync()
-        status, model = self.ai_engine.get_status()
-        self.status_label.configure(text=f"状态: {status} | 模型: {model}")
+        """刷新模型列表（异步，不阻塞界面）"""
+        try:
+            self.status_label.configure(text="状态: 正在检测...")
+        except Exception:
+            pass
+
+        def worker():
+            try:
+                self.ai_engine.detect_local_ollama()
+                if hasattr(self.shell, "model_registry"):
+                    try:
+                        self.shell.model_registry._fetch_models(force=True)
+                    except Exception:
+                        pass
+                self.after(0, self._finalize_refresh)
+            except Exception as e:
+                msg = str(e)
+                self.after(0, lambda m=msg: self._on_refresh_error(m))
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_refresh_error(self, msg):
+        try:
+            self.status_label.configure(text=f"状态: 检测失败 ({msg})")
+        except Exception:
+            pass
+
+    def _finalize_refresh(self):
+        """在主线程里完成：启用引擎 + 更新 UI"""
+        # 1. 只有当用户从没选过时，才自动启用
+        if self.ai_engine.provider is None and self.ai_engine._model_user_choice is None:
+            try:
+                text_models = self.ai_engine.get_text_models()
+            except Exception:
+                text_models = []
+            if text_models:
+                chosen = text_models[0]
+                self.ai_engine.provider = "ollama"
+                self.ai_engine.model = chosen
+                self.ai_engine._model_user_choice = True
+                try:
+                    self.shell.config.set("ai.model", chosen, self.shell.username)
+                    self.shell.config.set("ai.online_enabled", True, self.shell.username)
+                    self.shell.config.save_user_config(self.shell.username)
+                except Exception:
+                    pass
+
+        # 2. 更新状态栏
+        try:
+            status, model = self.ai_engine.get_status()
+            self.status_label.configure(text=f"状态: {status} | 模型: {model or '无'}")
+        except Exception:
+            pass
+
+        # 3. 刷新下拉框
+        try:
+            self._sync_model_selector()
+        except Exception:
+            pass
+
+    def _apply_refresh_result(self, status, model):
+        """在主线程里更新状态栏 + 下拉框"""
+        try:
+            self.status_label.configure(text=f"状态: {status} | 模型: {model or '无'}")
+        except Exception:
+            pass
+        self._sync_model_selector()
 
     def toggle_thinking(self):
         self.think_visible = not self.think_visible
@@ -31915,11 +35196,10 @@ class AIChatWindow(KikiWindow):
         self.chat_display.insert("end", f"👤 您: {text}\n")
         self.chat_display.configure(state="disabled")
 
-        # 确保模型选择已完成（弹窗询问）
         if self.ai_engine.provider is None and self.ai_engine._model_user_choice is None:
             self.ai_engine._try_enable_model_sync()
 
-        self.ai_engine.chat(text)
+        self.ai_engine.chat(text, target="chat", reply_callback=self._show_ai_reply)
 
     def _show_thinking(self, thinking):
         self.think_display.configure(state="normal")
