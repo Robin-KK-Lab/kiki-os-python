@@ -25670,7 +25670,11 @@ def register(api):
         if hasattr(self, "gui_app") and self.gui_app and self.gui_app.winfo_exists():
             self.gui_app.after(50, self.gui_app._do_print_prompt)
         else:
-            self._print_prompt()
+            try:
+                sys.stdout.write(self.get_prompt())
+                sys.stdout.flush()
+            except Exception:
+                pass
 
     @command("morifetchex", "system", "显示详细的系统信息（硬件、内存、启动时间）")
     def morifetchex_cmd(self, args, src=None):
