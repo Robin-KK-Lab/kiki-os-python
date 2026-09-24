@@ -1,4 +1,4 @@
-﻿# KIKI OS
+# KIKI OS
 
 > 一个用纯 Python 从零搭建的虚拟操作系统 + 图形桌面 + AI 助手。
 
@@ -70,6 +70,7 @@ python kiki_os.py
 
 ```bash
 python kiki_os.py --terminal                   # 纯终端模式
+# 纯终端模式下不会启动图形界面，适合服务器/无桌面环境
 python kiki_os.py --exec "help" --auto-login admin
 python kiki_os.py --play snake admin
 ```
@@ -100,7 +101,7 @@ python kiki_os.py --play snake admin
 ### v9.0 (2026-09)
 - AI 支持离线 / 在线 / Ollama 三模式
 - AST 工具协议
-- 沙盒禁结果不过程
+- 沙盒从"禁过程"改为"禁结果"
 - Python REPL 非阻塞
 - 语音识别主线程调度修复
 
