@@ -89,22 +89,25 @@ python kiki_os.py --play snake admin                  # 直接启动游戏
 | `snapshot create` | 创建系统快照 |
 | `refreshdesktop` | 刷新桌面图标 |
 
-## 更新日志
+## 发展史
 
-### v9.1 (2026-09)
-- 桌面图标与 VFS Desktop 目录双向同步
-- 拖拽实时网格对齐 + 就近吸附
-- 审计 VFS 密钥持久化（跨会话可解密）
-- 首次启动自动生成 YARA 规则库
-- 特征库保存立即生效（无需重启）
-- cd/ls 区分「路径不存在」与「权限不足」
+从 v0.14 的 MiniOS 到今天的 KIKI OS，完整版本记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-### v9.0 (2026-09)
-- AI 支持离线 / 在线 / Ollama 三模式
-- AST 工具协议
-- 沙盒从"禁过程"改为"禁结果"
-- Python REPL 非阻塞
-- 语音识别主线程调度修复
+| 版本 | 代号 | 里程碑 |
+|---|---|---|
+| **v0.14** | MiniOS | 🚀 第一个公开版本 |
+| **v1.0** | KIKI OS | 正式更名，大胆创新 |
+| **v2.0** | CTk 新生 | UI 从 Tk 迁移到 CTk |
+| **v3.0** | 多用户纪元 | 多用户逻辑 + VFS 扩充 |
+| **v4.0** | Play & Persist | 小游戏 + 持久化 |
+| **v5.0** | Egg Hunt | 小彩蛋（凑数版） |
+| **v6.0** | Guardian | 审计日志 + 持久化数据统一 |
+| **v7.0** | Renaissance | 解释器 + AI + 核心应用 |
+| **v8.0** | Metropolis | 桌面生态 + 系统工具全上 |
+| **v9.0** | Voice Awakening | AI + 语音 + 沙盒 |
+| **v9.1** | Desktop Sync | 桌面双向同步 + GPL v3 |
+
+---
 
 ## 许可
 
