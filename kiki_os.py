@@ -37726,15 +37726,42 @@ class PyOSLabWindow(KikiWindow):
 if __name__ == "__main__":
     import sys
 
+    # ==================== 位置无关的参数解析 ====================
+    argv = sys.argv[1:]
+
+    def _get_opt(flag):
+        """取 --flag 后面的值（跳过以 -- 开头的下一个参数）"""
+        if flag in argv:
+            idx = argv.index(flag)
+            if idx + 1 < len(argv):
+                val = argv[idx + 1]
+                if not val.startswith("--"):
+                    return val
+        return None
+
+    is_test = "--test" in argv
+    is_terminal = "--terminal" in argv or "-t" in argv
+    auto_login_user = _get_opt("--auto-login")
+    exec_cmd = _get_opt("--exec")
+
+    # --play <game> [user]
+    play_game = None
+    play_user = None
+    if "--play" in argv:
+        idx = argv.index("--play")
+        if idx + 1 < len(argv):
+            play_game = argv[idx + 1]
+        if idx + 2 < len(argv) and not argv[idx + 2].startswith("--"):
+            play_user = argv[idx + 2]
+
     # ==================== 测试模式 ====================
-    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+    if is_test:
         unittest.main(argv=[""], exit=False)
         sys.exit(0)
 
     # ==================== 直接启动游戏 ====================
-    if len(sys.argv) >= 4 and sys.argv[1] == "--play":
-        game = sys.argv[2]
-        user = sys.argv[3]
+    if play_game:
+        user = play_user or auto_login_user or "admin"
         shell = KIKIShell()
         with shell._lock:
             if user not in shell.users:
@@ -37744,58 +37771,54 @@ if __name__ == "__main__":
         shell.fs.cwd = shell.fs.resolve(f"/home/{user}", user)
         shell._load_user_env()
         shell.apply_config()
-        gm = getattr(shell, f"{game}_cmd", None)
+        gm = getattr(shell, f"{play_game}_cmd", None)
         if gm:
             gm("")
         else:
-            print(f"游戏 {game} 未找到")
+            print(f"游戏 {play_game} 未找到")
         sys.exit(0)
 
     # ==================== 执行单条命令后退出 ====================
-    if len(sys.argv) >= 3 and sys.argv[1] == "--exec":
+    if exec_cmd:
         shell = KIKIShell()
-        if "--auto-login" in sys.argv:
-            idx = sys.argv.index("--auto-login") + 1
-            if idx < len(sys.argv):
-                user = sys.argv[idx]
-                shell.username = user
-                shell.fs.cwd = shell.fs.resolve(f"/home/{user}", user)
-                shell._load_user_env()
-                shell.apply_config()
-            else:
-                print("错误：--auto-login 需要用户名")
+        if auto_login_user:
+            user = auto_login_user
+            if user not in shell.users:
+                print(f"用户 {user} 不存在")
                 sys.exit(1)
+            shell.username = user
+            shell.fs.cwd = shell.fs.resolve(f"/home/{user}", user)
+            shell._load_user_env()
+            shell.apply_config()
         else:
             shell.login()
-        cmd_idx = sys.argv.index("--exec") + 1
-        if cmd_idx < len(sys.argv):
-            shell._execute(sys.argv[cmd_idx])
-        else:
-            print("错误：--exec 需要命令")
-            sys.exit(1)
+        shell._execute(exec_cmd)
         sys.exit(0)
 
-    # ==================== 纯终端模式（新增） ====================
-    if "--terminal" in sys.argv or "-t" in sys.argv:
+    # ==================== 纯终端模式 ====================
+    if is_terminal:
         shell = KIKIShell()
-        # 检查是否附带 --auto-login
-        if "--auto-login" in sys.argv:
-            idx = sys.argv.index("--auto-login") + 1
-            if idx < len(sys.argv):
-                user = sys.argv[idx]
-                shell.username = user
-                shell.fs.cwd = shell.fs.resolve(f"/home/{user}", user)
-                shell._load_user_env()
-                shell.apply_config()
-            else:
-                print("错误：--auto-login 需要用户名")
+        if auto_login_user:
+            user = auto_login_user
+            if user not in shell.users:
+                print(f"用户 {user} 不存在")
                 sys.exit(1)
+            shell.username = user
+            shell.fs.cwd = shell.fs.resolve(f"/home/{user}", user)
+            shell._load_user_env()
+            shell.apply_config()
         else:
-            shell.login()  # 普通交互式登录
-        shell.run()  # 进入 Shell 命令循环
+            shell.login()
+        shell.run()
         sys.exit(0)
+
+    # ==================== 单独的 --auto-login（无 --terminal / --exec） ====================
+    if auto_login_user:
+        print("⚠️ --auto-login 需要配合 --terminal 或 --exec 使用。")
+        print(f"   例如: python kiki_os.py --terminal --auto-login {auto_login_user}")
+        print(f"         python kiki_os.py --exec \"help\" --auto-login {auto_login_user}")
+        print("   即将进入普通 GUI 模式（需要手动登录）...\n")
 
     # ==================== 默认：启动 GUI ====================
     app = KIKIGUI()
     app.mainloop()
-# https://github.com/Robin-KK-Lab
