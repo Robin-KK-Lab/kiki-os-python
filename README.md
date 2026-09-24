@@ -71,8 +71,9 @@ python kiki_os.py
 ```bash
 python kiki_os.py --terminal                   # 纯终端模式
 # 纯终端模式下不会启动图形界面，适合服务器/无桌面环境
-python kiki_os.py --exec "help" --auto-login admin
-python kiki_os.py --play snake admin
+python kiki_os.py --exec "help" --auto-login admin    # 执行完自动退出
+python kiki_os.py --play snake admin                  # 直接启动游戏
+# 注意：--auto-login 需要配合 --terminal 或 --exec 才能生效，不能单独用
 ```
 
 ## 常用命令
