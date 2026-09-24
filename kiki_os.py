@@ -1,3 +1,7 @@
+import os
+os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+os.environ["LITELLM_LOG"] = "ERROR"
+import hy
 import ctypes
 import ast
 import asyncio
@@ -8,7 +12,6 @@ import http.server
 import json
 import logging
 import math
-import os
 import queue
 import random
 import re
@@ -2429,9 +2432,11 @@ class SecureAudit:
         self.fs = fs
         self.key = key
         self._log_buffer = []
-        # 宿主机密钥与日志
+
+        # ===== 宿主机密钥与日志 =====
         self.host_key_path = os.path.join(os.path.expanduser("~"), ".kiki_audit.key")
         self.host_log_path = os.path.join(os.path.expanduser("~"), "kiki_audit.log")
+
         # 加载或生成宿主机密钥
         if os.path.exists(self.host_key_path):
             with open(self.host_key_path, "rb") as f:
@@ -2443,19 +2448,68 @@ class SecureAudit:
             os.chmod(self.host_key_path, 0o600)
         self.host_cipher = Fernet(host_key)
 
-        # VFS 加密密钥
-        if key is None:
-            import os as host_os
-
-            env_key = host_os.environ.get("KIKI_AUDIT_KEY")
-            if env_key:
-                key = env_key.encode()
-            else:
-                key = Fernet.generate_key()
-                print("⚠️ 审计日志密钥未设置，使用随机密钥（日志将无法跨会话解密）")
-        self.cipher = Fernet(key) if HAS_CRYPTO else None
+        # ===== VFS 加密密钥（持久化版本）=====
+        self.cipher = None
+        if HAS_CRYPTO:
+            vfs_key = self._load_or_create_vfs_key(key)
+            if vfs_key:
+                try:
+                    self.cipher = Fernet(vfs_key)
+                except Exception as e:
+                    logging.error(f"VFS 审计密钥无效: {e}")
+                    self.cipher = None
 
     # ---------- 恢复 log 方法 ----------
+    def _load_or_create_vfs_key(self, explicit_key=None):
+        """按优先级加载 VFS 加密密钥：
+        1. 参数显式传入（最高优先级）
+        2. 环境变量 KIKI_AUDIT_KEY
+        3. 磁盘文件 ~/.kiki_os/audit_vfs.key
+        4. 都没有 → 生成新密钥并写入磁盘
+
+        返回 bytes 类型的合法 Fernet key，失败返回 None（调用方会退化为明文缓冲）。
+        """
+        # 1. 显式传入
+        if explicit_key is not None:
+            if isinstance(explicit_key, str):
+                explicit_key = explicit_key.encode()
+            return explicit_key
+
+        # 2. 环境变量
+        env_key = os.environ.get("KIKI_AUDIT_KEY")
+        if env_key:
+            return env_key.encode() if isinstance(env_key, str) else env_key
+
+        # 3. 磁盘文件
+        key_path = os.path.join(KIKI_DATA_DIR, "audit_vfs.key")
+        if os.path.exists(key_path):
+            try:
+                with open(key_path, "rb") as f:
+                    data = f.read().strip()
+                if data:
+                    return data
+                logging.warning(f"VFS 审计密钥文件为空: {key_path}，将重新生成")
+            except Exception as e:
+                logging.error(f"读取 VFS 审计密钥失败: {e}")
+
+        # 4. 生成新密钥并持久化
+        try:
+            new_key = Fernet.generate_key()
+            os.makedirs(os.path.dirname(key_path), exist_ok=True)
+            with open(key_path, "wb") as f:
+                f.write(new_key)
+            try:
+                os.chmod(key_path, 0o600)
+            except Exception:
+                pass
+            print(f"🔐 VFS 审计密钥已生成并保存到: {key_path}")
+            return new_key
+        except Exception as e:
+            logging.error(f"生成/保存 VFS 审计密钥失败: {e}")
+            # 兜底：本次会话临时密钥（会警告，但不阻断启动）
+            print("⚠️ VFS 审计密钥无法持久化，使用本次会话临时密钥（重启后旧日志将无法解密）")
+            return Fernet.generate_key()
+        
     def log(self, action, user):
         try:
             timestamp = datetime.now().isoformat()
@@ -2509,6 +2563,9 @@ class SecureAudit:
         lines = content.splitlines()
         decrypted = []
         for line in lines:
+            line = line.strip()
+            if not line:
+                continue
             try:
                 raw = base64.b64decode(line)
                 dec = self.cipher.decrypt(raw).decode()
@@ -3667,26 +3724,31 @@ class VirtualFS:
                 parts.append(part)
         return "/" + "/".join(parts)
 
-    def resolve(self, path: str, user: str | None = None) -> Node | None:
+    def resolve(self, path: str, user: str | None = None, raise_on_denied: bool = False) -> Node | None:
         abs_path = self._resolve(path)
         if abs_path in self._node_cache:
             return self._node_cache[abs_path]
         if abs_path == "/":
             return self.root
         current = self.root
+        traversed = "/"
         for part in abs_path.split("/")[1:]:
             if not part:
                 continue
             if not isinstance(current, Directory):
                 return None
-            # 获取子节点，不进行权限检查
+            # 先检查进入权限
+            if not self.check_permission(user, current, "x"):
+                if raise_on_denied:
+                    raise PermissionDeniedError(
+                        f"权限不足：无法进入 {traversed.rstrip('/') or '/'}"
+                    )
+                return None
             child = current.get_child(part, user)
             if child is None:
                 return None
-            # 检查当前目录的 x 权限，确保可以进入
-            if not self.check_permission(user, current, "x"):
-                return None
             current = child
+            traversed += part + "/"
         self._node_cache[abs_path] = current
         return current
 
@@ -3868,10 +3930,14 @@ class VirtualFS:
             else:
                 return self.move_to_trash(path, user)
 
-    def listdir(self, path, user):
-        obj = self.resolve(path, user) if path != "." else self.cwd
+    def listdir(self, path, user, raise_on_denied=False):
+        try:
+            obj = self.resolve(path, user, raise_on_denied=raise_on_denied) if path != "." else self.cwd
+        except PermissionDeniedError:
+            if raise_on_denied:
+                raise
+            return None
         if isinstance(obj, Directory) and self.check_permission(user, obj, "x"):
-            # 使用 list_children 方法
             return obj.list_children(user)
         return None
 
@@ -12844,11 +12910,10 @@ class WorkspaceManager(KikiWindow):
             # 检查是否已经在窗口中，避免重复注册
             if self not in self.gui.windows:
                 self.gui._add_window(self)
-                print("[DEBUG] 手动注册 WorkspaceManager 到主窗口成功")
             else:
-                print("[DEBUG] WorkspaceManager 已经注册，跳过手动注册")
+                pass
         else:
-            print("[DEBUG] 警告：无法注册 WorkspaceManager，gui 未就绪")
+            pass
         # ========================================================
 
     # ============================================================
@@ -13915,10 +13980,17 @@ class UnifiedAIEngine:
             {"name": "launch_game", "description": "启动游戏，可选：snake/minesweeper/tetris/game2048/guess/typing/tictac/breakout", "args": {"game": "string"}},
         ]
 
-        self.tools_desc = "\n".join(
-            [f"- {t['name']}: {t['description']} (参数: {json.dumps(t['args'], ensure_ascii=False)})"
-             for t in self.tools]
-        )
+        # 用函数签名风格描述工具，方便 AI 直接输出 tool(arg=value)
+        def _fmt_tool(t):
+            args = t.get("args", {})
+            if not args:
+                sig = f"{t['name']}()"
+            else:
+                params = ", ".join(f"{k}: {v}" for k, v in args.items())
+                sig = f"{t['name']}({params})"
+            return f"- {sig}\n    → {t['description']}"
+
+        self.tools_desc = "\n".join(_fmt_tool(t) for t in self.tools)
 
         self.system_prompt = (
             "你是 KIKI OS 的智能控制核心。\n"
@@ -13927,10 +13999,19 @@ class UnifiedAIEngine:
             "【工具调用规则】\n"
             "你有以下工具可用：\n"
             f"{self.tools_desc}\n"
-            "当用户请求涉及这些工具时，请以 JSON 格式输出调用指令，每行一个，例如：\n"
-            '{"tool": "new_folder", "args": {"path": "test"}}\n'
-            "如果一次需要多个动作，可以连续输出多行 JSON，系统会按顺序执行。\n"
-            "如果用户只是普通对话，直接正常回答，不要添加工具 JSON。\n"
+            "\n"
+            "当用户请求涉及这些工具时，请以 Python 函数调用形式输出，每行一个，例如：\n"
+            'new_folder(path="test")\n'
+            'write_file(path="a.txt", content="hello")\n'
+            "\n"
+            "参数要求：\n"
+            "  • 只写关键字参数（name=value 形式）\n"
+            "  • 值必须是字面量：字符串加引号、数字直接写、布尔用 True/False、空值用 None\n"
+            "  • 不要写变量、表达式、f-string、函数调用嵌套\n"
+            "  • 不要包在 ```python 代码块里，也不要写成 JSON\n"
+            "\n"
+            "一次需要多个动作时，可以连续输出多行，系统会按顺序执行。\n"
+            "如果用户只是普通对话，直接正常回答，不要输出函数调用。\n"
             "【路径规则】\n"
             "当用户提到文件名而未给出完整路径时，优先使用当前工作目录。\n"
             "除非用户明确说\"桌面\"，否则不要默认使用 Desktop。\n"
@@ -14590,10 +14671,156 @@ class UnifiedAIEngine:
         return re.sub(r'\[THINKING\].*?\[/THINKING\]', '', text, flags=re.DOTALL).strip()
 
     # ==================== 工具解析 ====================
+    # ==================== 工具解析 ====================
     def parse_tool_calls(self, text):
-        """把 AI 回复中的 JSON 工具调用解析成 action 元组列表。"""
+        """
+        解析 AI 回复中的工具调用。
+        优先用 AST 解析 Python 函数调用格式（新协议）：
+            new_folder(path="test")
+            write_file(path="a.txt", content="hello")
+        若 AST 未匹配到任何调用，回退到旧的 JSON 行解析（兼容旧提示词）。
+        返回格式与原实现相同：action 元组列表。
+        """
+        import ast as _ast
         import re
+
+        # 1. 去掉思考块
+        text = re.sub(r"\[THINKING\].*?\[/THINKING\]", "", text, flags=re.DOTALL)
+
+        actions = self._parse_ast_calls(text, _ast)
+        if actions:
+            return actions
+
+        # 2. AST 没找到，回退 JSON（兼容）
+        return self._parse_json_calls(text)
+
+    # ---------- AST 解析 ----------
+    def _parse_ast_calls(self, text, _ast):
+        import re
+
+        known_tools = {t["name"] for t in self.tools}
+        candidates = []
+
+        # 2.1 从代码围栏里抽（容忍模型仍写了 ```python）
+        for block in re.findall(r"```(?:python|py)?\s*(.*?)```", text, flags=re.DOTALL):
+            for line in block.strip().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    candidates.append(line)
+
+        # 2.2 从正文中抽：以已知工具名开头 + 左括号 的行
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", line)
+            if m and m.group(1) in known_tools:
+                candidates.append(line)
+
         actions = []
+        seen_lines = set()
+        for line in candidates:
+            # ★ 规范化 key：去掉首尾空白和换行，防止同一行被抽两次
+            norm_key = " ".join(line.split())
+            if norm_key in seen_lines:
+                continue
+            seen_lines.add(norm_key)
+
+            # 只保留第一个完整调用（防止行内追加解释文字）
+            # 找到第一个成对的右括号
+            depth = 0
+            end_idx = -1
+            for i, ch in enumerate(line):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end_idx = i
+                        break
+            if end_idx == -1:
+                continue
+            expr = line[: end_idx + 1]
+
+            try:
+                tree = _ast.parse(expr, mode="eval")
+            except SyntaxError:
+                continue
+            if not isinstance(tree.body, _ast.Call):
+                continue
+
+            call = tree.body
+            # 函数名
+            if isinstance(call.func, _ast.Name):
+                tool_name = call.func.id
+            elif isinstance(call.func, _ast.Attribute):
+                tool_name = call.func.attr
+            else:
+                continue
+
+            if tool_name not in known_tools:
+                continue
+
+            # 收集关键字参数
+            args = {}
+            for kw in call.keywords:
+                if kw.arg is None:  # **kwargs
+                    continue
+                args[kw.arg] = self._safe_literal_eval(kw.value, _ast)
+
+            # 收集位置参数 → 按 tools 里声明的顺序映射到参数名
+            if call.args:
+                tool_spec = next((t for t in self.tools if t["name"] == tool_name), None)
+                param_names = list(tool_spec.get("args", {}).keys()) if tool_spec else []
+                for i, pos in enumerate(call.args):
+                    if i < len(param_names):
+                        args.setdefault(param_names[i], self._safe_literal_eval(pos, _ast))
+
+            action = self._dispatch_tool(tool_name, args)
+            if action is not None:
+                actions.append(action)
+
+        return actions
+
+    @staticmethod
+    def _safe_literal_eval(node, _ast):
+        """尝试用 ast.literal_eval 取值；失败则退回 ast.unparse 的字符串。"""
+        try:
+            return _ast.literal_eval(node)
+        except Exception:
+            try:
+                return _ast.unparse(node)
+            except Exception:
+                return None
+
+    # ---------- JSON 解析（兼容旧格式） ----------
+    def _parse_json_calls(self, text):
+        import json as _json
+        import re
+
+        actions = []
+        matches = re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text)
+        for match in matches:
+            try:
+                data = _json.loads(match)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            tool = (data.get("tool") or "").strip()
+            args = data.get("args", {}) or {}
+            if not tool:
+                continue
+            action = self._dispatch_tool(tool, args)
+            if action is not None:
+                actions.append(action)
+        return actions
+
+    # ---------- 统一分发：工具名+参数字典 → action 元组 ----------
+    def _dispatch_tool(self, tool, args):
+        """把工具名和参数字典转成 action 元组。找不到返回 None。"""
+        if not isinstance(args, dict):
+            args = {}
 
         SIMPLE_MAP = {
             "open_file_manager": ("open", "/"),
@@ -14622,74 +14849,64 @@ class UnifiedAIEngine:
             "list_users": ("execute", "users"),
             "process_list": ("execute", "ps"),
         }
+        if tool in SIMPLE_MAP:
+            return SIMPLE_MAP[tool]
 
-        matches = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text)
-        for match in matches:
-            try:
-                data = json.loads(match)
-                tool = data.get("tool", "").strip()
-                args = data.get("args", {})
+        if tool == "open_browser":
+            return ("open", args.get("url", "browser"))
+        if tool == "open_editor":
+            return ("open", args.get("path", "editor"))
+        if tool == "new_folder":
+            return ("new_folder", args.get("path", "新文件夹"))
+        if tool == "new_file":
+            return ("new_file", args.get("path", "new.txt"), args.get("content", ""))
+        if tool == "write_file":
+            return ("write_file", args.get("path", ""), args.get("content", ""))
+        if tool == "read_file":
+            return ("read_file", args.get("path", ""))
+        if tool == "delete":
+            return ("delete", args.get("path", ""))
+        if tool == "permanent_delete":
+            return ("permanent_delete", args.get("path", ""))
+        if tool == "rename":
+            return ("rename", args.get("old_path", ""), args.get("new_name", ""))
+        if tool == "move":
+            return ("move", args.get("src", ""), args.get("dst", ""))
+        if tool == "copy":
+            return ("copy", args.get("src", ""), args.get("dst", ""))
+        if tool == "cd":
+            return ("cd", args.get("path", "/"))
+        if tool == "search_file":
+            return ("search_file", args.get("keyword", ""))
+        if tool == "execute_command":
+            return ("execute", args.get("command", "dir"))
+        if tool == "ping":
+            return ("execute", f"ping {args.get('host', '')}".strip())
+        if tool == "download":
+            d = args.get("dest", "")
+            return ("execute", f"download {args.get('url', '')} {d}".strip())
+        if tool == "weather":
+            return ("execute", f"weather {args.get('city', '')}".strip())
+        if tool == "calc":
+            return ("execute", f"calc {args.get('expr', '')}".strip())
+        if tool == "get_setting":
+            return ("execute", f"settings get {args.get('key', '')}".strip())
+        if tool == "set_setting":
+            return ("execute", f"settings set {args.get('key', '')} {args.get('value', '')}".strip())
+        if tool == "change_wallpaper":
+            return ("change_wallpaper", args.get("color", "#1e1e1e"))
+        if tool == "change_language":
+            return ("execute", f"settings set locale.language {args.get('lang', 'en')}")
+        if tool == "add_user":
+            return ("add_user", args.get("username", ""), args.get("password", ""))
+        if tool == "delete_user":
+            return ("delete_user", args.get("username", ""))
+        if tool == "change_password":
+            return ("change_password", args.get("new_password", ""))
+        if tool == "launch_game":
+            return ("execute", args.get("game", ""))
 
-                if tool in SIMPLE_MAP:
-                    actions.append(SIMPLE_MAP[tool])
-                    continue
-
-                if tool == "open_browser":
-                    actions.append(("open", args.get("url", "browser")))
-                elif tool == "open_editor":
-                    actions.append(("open", args.get("path", "editor")))
-                elif tool == "new_folder":
-                    actions.append(("new_folder", args.get("path", "新文件夹")))
-                elif tool == "new_file":
-                    actions.append(("new_file", args.get("path", "new.txt"), args.get("content", "")))
-                elif tool == "write_file":
-                    actions.append(("write_file", args.get("path", ""), args.get("content", "")))
-                elif tool == "read_file":
-                    actions.append(("read_file", args.get("path", "")))
-                elif tool == "delete":
-                    actions.append(("delete", args.get("path", "")))
-                elif tool == "permanent_delete":
-                    actions.append(("permanent_delete", args.get("path", "")))
-                elif tool == "rename":
-                    actions.append(("rename", args.get("old_path", ""), args.get("new_name", "")))
-                elif tool == "move":
-                    actions.append(("move", args.get("src", ""), args.get("dst", "")))
-                elif tool == "copy":
-                    actions.append(("copy", args.get("src", ""), args.get("dst", "")))
-                elif tool == "cd":
-                    actions.append(("cd", args.get("path", "/")))
-                elif tool == "search_file":
-                    actions.append(("search_file", args.get("keyword", "")))
-                elif tool == "execute_command":
-                    actions.append(("execute", args.get("command", "dir")))
-                elif tool == "ping":
-                    actions.append(("execute", f"ping {args.get('host', '')}".strip()))
-                elif tool == "download":
-                    d = args.get("dest", "")
-                    actions.append(("execute", f"download {args.get('url', '')} {d}".strip()))
-                elif tool == "weather":
-                    actions.append(("execute", f"weather {args.get('city', '')}".strip()))
-                elif tool == "calc":
-                    actions.append(("execute", f"calc {args.get('expr', '')}".strip()))
-                elif tool == "get_setting":
-                    actions.append(("execute", f"settings get {args.get('key', '')}".strip()))
-                elif tool == "set_setting":
-                    actions.append(("execute", f"settings set {args.get('key', '')} {args.get('value', '')}".strip()))
-                elif tool == "change_wallpaper":
-                    actions.append(("change_wallpaper", args.get("color", "#1e1e1e")))
-                elif tool == "change_language":
-                    actions.append(("execute", f"settings set locale.language {args.get('lang', 'en')}"))
-                elif tool == "add_user":
-                    actions.append(("add_user", args.get("username", ""), args.get("password", "")))
-                elif tool == "delete_user":
-                    actions.append(("delete_user", args.get("username", "")))
-                elif tool == "change_password":
-                    actions.append(("change_password", args.get("new_password", "")))
-                elif tool == "launch_game":
-                    actions.append(("execute", args.get("game", "")))
-            except Exception:
-                continue
-        return actions
+        return None
 
     # ==================== 模型请求 ====================
     def _query_ollama(self, model, messages):
@@ -15938,6 +16155,9 @@ class KIKIShell:
             self.voice = None
             print("语音助手不可用（请安装 PyAudio）")
         # ===== 初始化威胁数据库和杀毒引擎（内嵌） =====
+        # ★ 必须在 load_state() 之后调用，否则会被数据库快照覆盖
+        self._ensure_threats_rules()
+
         self.threat_db = ThreatDatabase(self.fs, "threats.json")
 
         # 开机自动更新威胁库（后台线程）
@@ -15983,6 +16203,132 @@ class KIKIShell:
         )
         self.ai_worker.start()
         # ====================================
+
+    def _ensure_threats_rules(self):
+        """确保 /etc/kiki_threats.rules 存在，不存在则写入默认 YARA 规则库。"""
+        path = "/etc/kiki_threats.rules"
+
+        # 已存在 → 跳过
+        try:
+            if self.fs.resolve(path, "root"):
+                return
+        except Exception:
+            pass
+
+        # 确保 /etc 目录存在
+        if not self.fs.resolve("/etc", "root"):
+            self.fs.mkdir("/etc", user="root", owner="root", mode=0o755)
+
+        default_rules = r'''
+/*
+ * KIKI OS 默认 YARA 规则库
+ * 版本: 1.0
+ * 生成: 首次启动时自动创建
+ * 提示: 在"安全中枢 → 特征库"中修改后点保存即可立即生效（无需重启）
+ */
+
+rule KIKI_Dangerous_Python_Eval
+{
+    meta:
+        description = "检测 eval/exec 动态代码执行"
+        severity = "high"
+    strings:
+        $s1 = "eval(" nocase
+        $s2 = "exec(" nocase
+    condition:
+        any of them
+}
+
+rule KIKI_System_Call
+{
+    meta:
+        description = "检测 os.system / subprocess 调用"
+        severity = "medium"
+    strings:
+        $s1 = "os.system(" nocase
+        $s2 = "subprocess.Popen" nocase
+        $s3 = "subprocess.call" nocase
+        $s4 = "subprocess.run" nocase
+    condition:
+        any of them
+}
+
+rule KIKI_Reverse_Shell
+{
+    meta:
+        description = "检测反弹 shell 特征"
+        severity = "critical"
+    strings:
+        $s1 = "/bin/sh" nocase
+        $s2 = "/bin/bash" nocase
+        $s3 = "socket.socket" nocase
+        $s4 = "nc -e" nocase
+    condition:
+        2 of them
+}
+
+rule KIKI_Network_Backdoor
+{
+    meta:
+        description = "检测网络后门"
+        severity = "high"
+    strings:
+        $s1 = "ftplib.FTP" nocase
+        $s2 = "smtplib.SMTP" nocase
+        $s3 = "paramiko.SSHClient" nocase
+    condition:
+        any of them
+}
+
+rule KIKI_Crypto_Miner
+{
+    meta:
+        description = "检测挖矿特征"
+        severity = "critical"
+    strings:
+        $s1 = "stratum+tcp://" nocase
+        $s2 = "xmrig" nocase
+        $s3 = "minerd" nocase
+    condition:
+        any of them
+}
+
+rule KIKI_Credential_Stealer
+{
+    meta:
+        description = "检测凭据窃取特征"
+        severity = "critical"
+    strings:
+        $s1 = "Login Data" nocase
+        $s2 = "cookies.sqlite" nocase
+        $s3 = "keychain" nocase
+    condition:
+        2 of them
+}
+'''.strip()
+
+        try:
+            ok = self.fs.create_file(
+                path,
+                default_rules,
+                user="root",
+                owner="admin",
+                mode=0o644,
+            )
+            if ok:
+                print(f"✅ 已生成默认 YARA 规则库: {path}")
+                # ★ 立即落盘
+                try:
+                    save_state(self.fs, self.config)
+                    print(f"💾 已保存到数据库")
+                except Exception as e:
+                    logging.error(f"保存 YARA 规则到数据库失败: {e}")
+                    print(f"⚠️ 保存到数据库失败: {e}")
+            else:
+                print(f"❌ 生成默认 YARA 规则库失败: {path}")
+        except Exception as e:
+            logging.error(f"生成默认 YARA 规则失败: {e}")
+            print(f"❌ 生成默认 YARA 规则异常: {e}")
 
     @command("fuck", "misc", "20 个无意义方法（娱乐命令）")
     def fuck_cmd(self, args, src=None):
@@ -18471,7 +18817,11 @@ def register(api):
                 parts.remove("-l")
             if parts and not parts[0].startswith("-"):
                 path = parts[0]
-        items = self.fs.listdir(path, self.username)
+        try:
+            items = self.fs.listdir(path, self.username, raise_on_denied=True)
+        except PermissionDeniedError:
+            print(f"❌ 权限不足，无法访问：{path}")
+            return
         if items is None:
             print(_("dir_not_found"))
             return
@@ -18524,15 +18874,24 @@ def register(api):
     @command("cd", "files", "cmd_cd")
     def cd(self, args, src=None):
         if args:
-            args = args.replace("\\", "/")  # 将反斜杠转换为正斜杠
+            args = args.replace("\\", "/")  # 反斜杠转正斜杠
+
+        # 决定目标路径
         if not args:
-            home = f"/home/{self.username}"
-            new = self.fs.resolve(home, self.username)
+            target = f"/home/{self.username}"
         else:
-            new = self.fs.resolve(args, self.username)
+            target = args
+
+        # ===== 第一步：用 raise_on_denied 区分"不存在"和"无权限" =====
+        try:
+            new = self.fs.resolve(target, self.username, raise_on_denied=True)
+        except PermissionDeniedError:
+            print(f"❌ 权限不足，无法进入：{target}")
+            return
+
+        # ===== 第二步：路径不存在 =====
         if new is None:
-            # 路径不存在
-            # 如果用户输入的是文件名，提示使用 open/type
+            # 尝试拼接当前目录，看看是不是用户把文件名当路径了
             cwd = self.fs.get_abs_path(self.fs.cwd)
             full = f"{cwd}/{args}" if cwd != "/" else f"/{args}"
             node = self.fs.resolve(full, self.username)
@@ -18540,13 +18899,24 @@ def register(api):
                 print(f"'{args}' 是一个文件，请使用 'open {args}' 或 'type {args}' 来打开它。")
             else:
                 print(_("dir_not_found"))
-        elif isinstance(new, Directory) and self.fs.check_permission(self.username, new, "x"):
+            return
+
+        # ===== 第三步：目标是目录 =====
+        if isinstance(new, Directory):
+            # 检查目标目录本身的 x（进入）权限
+            if not self.fs.check_permission(self.username, new, "x"):
+                print(f"❌ 权限不足，无法进入：{target}")
+                return
             self.fs.cwd = new
-        else:
-            if isinstance(new, File):
-                print(f"'{args}' 是一个文件，请使用 'open {args}' 或 'type {args}' 来打开它。")
-            else:
-                print(_("permission_denied"))
+            return
+
+        # ===== 第四步：目标是文件 =====
+        if isinstance(new, File):
+            print(f"'{args}' 是一个文件，请使用 'open {args}' 或 'type {args}' 来打开它。")
+            return
+
+        # ===== 兜底 =====
+        print(_("permission_denied"))
 
     @command("pwd", "files", "cmd_pwd")
     def pwd(self, args, src=None):
@@ -21863,19 +22233,11 @@ def register(api):
 
     @command("df", "system", "cmd_df")
     def df_cmd(self, args, src=None):
-        print("[DEBUG] df_cmd called")
-        print(
-            f"[DEBUG] has gui_app? {hasattr(self, 'gui_app')} {self.gui_app if hasattr(self,'gui_app') else 'None'}"
-        )
         if hasattr(self, "gui_app") and self.gui_app:
-            print("[DEBUG] entering GUI branch")
             try:
                 win = DiskUsageWindow(self.gui_app, self)
-                print("[DEBUG] DiskUsageWindow created")
                 self.gui_app._add_window(win)
-                print("[DEBUG] window added")
             except Exception as e:
-                print(f"[DEBUG] EXCEPTION: {e}")
                 import traceback
 
                 traceback.print_exc()
@@ -23141,12 +23503,31 @@ def register(api):
         success_count = 0
         fail_count = 0
         fail_msgs = []
+        # ★ 去重：同样的 action 只执行一次，防止重复 mkdir/move
+        _seen = set()
+        _unique = []
+        for a in actions:
+            key = tuple(str(x) for x in a)
+            if key in _seen:
+                continue
+            _seen.add(key)
+            _unique.append(a)
+        actions = _unique
 
         def normalize_vfs_path(path, username):
             """将 Windows 路径或模糊路径转换为 VFS 绝对路径"""
             if not path:
                 return None
-            path = path.replace("\\", "/")
+            path = path.replace("\\", "/").strip()
+
+            # ★ 新增：先处理 ~ 前缀
+            if path == "~":
+                return home
+            if path.startswith("~/"):
+                rest = path[2:].lstrip("/")
+                return f"{home}/{rest}" if rest else home
+
+            # Windows 路径
             if path.lower().startswith("c:/users/"):
                 parts = path.split("/")
                 if len(parts) >= 3:
@@ -23154,17 +23535,23 @@ def register(api):
                     remainder = [p for p in remainder if p]
                     if remainder:
                         return f"{home}/" + "/".join(remainder)
-                    else:
-                        return home
+                    return home
                 return home
+
+            # 桌面
             if "desktop" in path.lower() or "桌面" in path:
                 if path.startswith("/home/"):
                     return path
                 cleaned = re.sub(r'^(desktop|桌面)[/\\]?', '', path, flags=re.IGNORECASE)
+                cleaned = cleaned.strip("/")
                 return f"{desktop}/{cleaned}" if cleaned else desktop
+
+            # 文档
             if "documents" in path.lower() or "文档" in path:
                 cleaned = re.sub(r'^(documents|文档)[/\\]?', '', path, flags=re.IGNORECASE)
+                cleaned = cleaned.strip("/")
                 return f"{home}/Documents/{cleaned}" if cleaned else f"{home}/Documents"
+
             return None
 
         def resolve_path(path, default_base=None):
@@ -26954,11 +27341,30 @@ class SecurityCenterWindow(KikiWindow):
         tab = self.tabview.tab("🧬 特征库")
         self.rule_text = ctk.CTkTextbox(tab, font=("Courier New", 11), height=200)
         self.rule_text.pack(fill="x", padx=10, pady=5)
-        self.rule_text.insert("end", "# 在此添加自定义 YARA 特征规则（纯文本匹配）\n")
-        self.rule_text.insert(
-            "end",
-            'rule KIKI_Threat {\n  strings: $s1 = "os.system" nocase\n  condition: $s1\n}\n',
-        )
+
+        # ★ 加载当前规则（而不是硬编码示例）
+        current_rules = ""
+        try:
+            current_rules = self.shell.fs.read_file("/etc/kiki_threats.rules", "admin") or ""
+        except Exception:
+            pass
+
+        if current_rules.strip():
+            self.rule_text.insert("end", current_rules)
+        else:
+            self.rule_text.insert(
+                "end",
+                "# 规则文件为空。\n"
+                "# 你可以编写 YARA 规则后点\"保存特征库到 VFS\"。\n"
+                "# 例如：\n"
+                "rule My_Rule {\n"
+                "    strings:\n"
+                "        $s1 = \"eval(\" nocase\n"
+                "    condition:\n"
+                "        $s1\n"
+                "}\n"
+            )
+
         btn_frame = ctk.CTkFrame(tab, fg_color="transparent")
         btn_frame.pack(pady=5)
         ctk.CTkButton(
@@ -27063,7 +27469,31 @@ class SecurityCenterWindow(KikiWindow):
     def _save_rules(self):
         content = self.rule_text.get("1.0", "end")
         self.shell.fs.write_file("/etc/kiki_threats.rules", content, "admin")
-        messagebox.showinfo("已保存", "特征库规则已写入 /etc/kiki_threats.rules\n重启后生效。")
+
+        # 立即验证规则能否编译（提前发现问题）
+        try:
+            import yara
+            try:
+                yara.compile(source=content)
+                messagebox.showinfo(
+                    "已保存",
+                    "特征库规则已保存并验证通过。\n"
+                    "下次扫描时将使用新规则，无需重启。"
+                )
+            except Exception as e:
+                messagebox.showwarning(
+                    "已保存但规则有误",
+                    f"规则文件已保存，但 YARA 编译失败：\n\n{e}\n\n"
+                    f"请修正规则后再次保存，否则扫描时会自动降级为内置扫描。"
+                )
+        except ImportError:
+            # 没有 yara 库，无法验证，但保存本身没问题
+            messagebox.showinfo(
+                "已保存",
+                "特征库规则已保存。\n"
+                "下次扫描时将使用新规则，无需重启。\n"
+                "（未检测到 YARA 引擎，扫描将使用内置特征匹配）"
+            )
 
     def _sync_from_web(self):
         self._log("📥 正在从 8080 端口同步威胁规则...")
@@ -27567,6 +27997,7 @@ class KIKIGUI(ctk.CTk):
             self.after(100, self._init)
 
         # 启动动画
+        self.after(2000, self._watch_desktop)
         self.after(100, boot_animation)
         # ===== ⭐ 结束 =====
         self.update_idletasks()
@@ -27755,19 +28186,33 @@ class KIKIGUI(ctk.CTk):
         if hasattr(btn, "_delete_btn") and btn._delete_btn:
             return
         try:
-            btn_x = btn.winfo_rootx() - self.icon_frame.winfo_rootx()
-            btn_y = btn.winfo_rooty() - self.icon_frame.winfo_rooty()
-            btn_w = btn.winfo_width()
-            btn_h = btn.winfo_height()
+            # ★ 关键：用 desktop_icon_positions 里记录的坐标
+            # 这是我们 place() 时自己写的值，100% 准确，不受 CTkButton 内部结构影响
+            pos = self.desktop_icon_positions.get(icon_id)
+            if pos:
+                btn_x, btn_y = pos
+            else:
+                # 兜底：没有记录才用 winfo
+                btn_x = btn.winfo_x()
+                btn_y = btn.winfo_y()
+
+            # 用 icon_size 而不是 winfo_width（尺寸也是异步的）
+            btn_w = self.icon_size
+            btn_h = self.icon_size
+
             del_w = 20
             del_h = 20
-            # 放在图标右上角外侧（右偏2px，上偏2px）
-            delete_x = btn_x + btn_w - del_w - 2
-            delete_y = btn_y + 2
+
+            # 放在图标右上角：一半压住图标，一半探出
+            delete_x = btn_x + btn_w - del_w // 2
+            delete_y = btn_y - del_h // 2
+
+            # 边界夹紧
             container_w = self.icon_frame.winfo_width()
             container_h = self.icon_frame.winfo_height()
             delete_x = max(0, min(delete_x, container_w - del_w))
             delete_y = max(0, min(delete_y, container_h - del_h))
+
             delete_btn = ctk.CTkButton(
                 self.icon_frame,
                 text="✕",
@@ -27782,8 +28227,13 @@ class KIKIGUI(ctk.CTk):
             delete_btn.bind("<Button-1>", lambda e: self._delete_desktop_icon(icon_id))
             delete_btn.place(x=delete_x, y=delete_y)
             btn._delete_btn = delete_btn
-        except Exception:
-            pass
+            try:
+                delete_btn.lift()
+            except Exception:
+                pass
+
+        except Exception as e:
+            print(f"[桌面] 创建删除按钮失败: {e}")
 
     def _hide_delete_buttons(self):
         for icon_id, info in list(self.desktop_icons.items()):
@@ -27876,40 +28326,68 @@ class KIKIGUI(ctk.CTk):
     def _delete_desktop_icon(self, icon_id):
         info = self.desktop_icons.get(icon_id)
         if info is None:
-            # 模糊匹配
             for iid in list(self.desktop_icons.keys()):
                 if icon_id in iid or iid in icon_id:
                     icon_id = iid
                     info = self.desktop_icons.get(icon_id)
                     break
             else:
-                messagebox.showinfo("提示", "无法找到要删除的图标")
                 return
         if info is None:
-            messagebox.showinfo("提示", "无法找到要删除的图标")
             return
-        btn = info.get("widget")
-        # 动态图标：确认后删除
-        if info.get("is_dynamic", False):
-            if not messagebox.askyesno("确认删除", f"确定要删除快捷方式 '{info['name']}' 吗？", parent=self):
+
+        icon_type = info.get("icon_type", "file")
+        name = info.get("name", "")
+        shortcut_file = info.get("shortcut_file")
+
+        # 1. 固定图标不允许删除
+        if not info.get("is_dynamic", False):
+            messagebox.showinfo("提示", f"'{name}' 是系统图标，不能删除")
+            return
+
+        # 2. 快捷方式：删 .shortcut 文件
+        if icon_type == "shortcut":
+            if not messagebox.askyesno("确认删除",
+                                        f"确定要删除快捷方式 '{name}' 吗？",
+                                        parent=self):
                 return
-            # 隐藏所有删除按钮
-            self._hide_delete_buttons()
-            if btn is not None:
+            if shortcut_file:
                 try:
-                    if btn.winfo_exists():
-                        btn.destroy()
-                except Exception:
-                    pass
-            name = info.get("name", "")
-            del self.desktop_icons[icon_id]
-            if icon_id in self.desktop_icon_positions:
-                del self.desktop_icon_positions[icon_id]
-            self._save_dynamic_icons()
-            self._show_notification(f"已删除快捷方式: {name}")
+                    self.shell.fs.delete(shortcut_file, self.username)
+                except Exception as e:
+                    print(f"[桌面] 删除快捷方式文件失败: {e}")
+        # 3. 普通文件/文件夹：移到回收站
         else:
-            # 固定图标：提示
-            messagebox.showinfo("提示", f"'{info.get('name', '')}' 是系统图标，不能删除")
+            vfs_path = f"/home/{self.username}/Desktop/{name}"
+            if not messagebox.askyesno("确认删除",
+                                        f"确定要把 '{name}' 移到回收站吗？",
+                                        parent=self):
+                return
+            try:
+                self.shell.fs.move_to_trash(vfs_path, self.username)
+            except Exception as e:
+                messagebox.showerror("错误", f"删除失败: {e}")
+                return
+
+        # 4. 销毁图标
+        btn = info.get("widget")
+        if btn is not None:
+            try:
+                if btn.winfo_exists():
+                    btn.destroy()
+            except Exception:
+                pass
+
+        self.desktop_icons.pop(icon_id, None)
+        self.desktop_icon_positions.pop(icon_id, None)
+        self.desktop_icon_names.pop(icon_id, None)
+        self._save_icon_positions()
+
+        # 通知文件管理器刷新
+        try:
+            self._refresh_all_file_managers(f"/home/{self.username}/Desktop")
+        except Exception:
+            pass
 
     def _show_menu_with_plugins(self, btn, label):
         """显示菜单，合并固定项和插件项"""
@@ -28687,31 +29165,60 @@ class KIKIGUI(ctk.CTk):
                 top.destroy()
 
     def _perform_snap_and_push(self, btn, icon_id):
-        x, y = btn.winfo_x(), btn.winfo_y()
-        # 网格对齐
-        grid_x = self.icon_grid_x
-        grid_y = self.icon_grid_y
-        origin_x = 20
-        origin_y = 20
-        x = max(0, min(round((x - origin_x) / grid_x) * grid_x + origin_x, self.icon_frame.winfo_width() - self.icon_size))
-        y = max(0, min(round((y - origin_y) / grid_y) * grid_y + origin_y, self.icon_frame.winfo_height() - self.icon_size))
-        # 检查该位置是否被占用
+        """松手时：位置已经在拖拽过程中实时网格对齐，这里只处理重叠。"""
+        if btn is None or not btn.winfo_exists():
+            return
+
+        # ★ 用拖拽过程最后算出的位置，而不是 winfo_x/y（Tkinter place 异步）
+        last = getattr(btn, "_last_drag_pos", None)
+        if last is not None:
+            x, y = last
+        else:
+            x, y = btn.winfo_x(), btn.winfo_y()
+
+        # 重叠检测
         if self._is_position_occupied(x, y, btn):
-            empty_slot = self._find_empty_grid_slot()
+            empty_slot = self._find_empty_grid_slot(x, y)   # ← 传入当前位置作为目标
             if empty_slot:
                 x, y = empty_slot
+
         btn.place(x=x, y=y)
+        try:
+            btn.update_idletasks()   # 强制让 place 立即生效
+        except Exception:
+            pass
+        btn._last_drag_pos = (x, y)
         self.desktop_icon_positions[icon_id] = (x, y)
-        self._save_dynamic_icons()
+
+        try:
+            self._save_icon_positions()
+        except AttributeError:
+            try:
+                self._save_dynamic_icons()
+            except Exception:
+                pass
 
     def _is_position_occupied(self, x, y, exclude_widget=None):
-        """检查 (x,y) 是否被其他图标占据（距离 < icon_size 视为重叠）"""
-        for info in self.desktop_icons.values():
+        """检查 (x,y) 是否被其他图标占据。
+        ★ 用 desktop_icon_positions 的坐标记录，而非 winfo_x/y（异步不准）。
+        """
+        for iid, info in self.desktop_icons.items():
             other = info.get("widget")
-            if other and other != exclude_widget and other.winfo_exists():
-                ox, oy = other.winfo_x(), other.winfo_y()
-                if abs(ox - x) < self.icon_size and abs(oy - y) < self.icon_size:
-                    return True
+            if other is None or other == exclude_widget:
+                continue
+            try:
+                if not other.winfo_exists():
+                    continue
+            except Exception:
+                continue
+
+            pos = self.desktop_icon_positions.get(iid)
+            if pos is None:
+                continue
+
+            ox, oy = pos
+            if abs(ox - x) < self.icon_size and abs(oy - y) < self.icon_size:
+                return True
         return False
 
     def _find_empty_slot(self):
@@ -28820,8 +29327,8 @@ class KIKIGUI(ctk.CTk):
             btn.after(100, lambda: btn.configure(width=original))
 
     def _create_desktop_icons(self):
-        """创建桌面图标：固定图标 + 动态快捷方式"""
-        # ========== 1. 销毁旧控件（同步刷新） ==========
+        """创建桌面图标：固定图标 + 从 VFS Desktop 目录同步"""
+        # ========== 1. 销毁旧控件 ==========
         for child in self.icon_frame.winfo_children():
             try:
                 child.destroy()
@@ -28831,37 +29338,22 @@ class KIKIGUI(ctk.CTk):
         self.desktop_icon_positions.clear()
         self.desktop_icon_names = {}
 
-        # ★ 强制 tkinter 处理销毁队列，避免旧控件残留
         try:
             self.icon_frame.update_idletasks()
         except Exception:
             pass
 
-        # ========== 2. 清空 VFS 缓存，确保读到新用户的配置 ==========
+        # ========== 2. 清缓存 ==========
         try:
             self.shell.fs._node_cache.clear()
             self.shell.fs._perm_cache.clear()
         except Exception:
             pass
 
-        # ========== 3. 从新用户配置里读取图标信息 ==========
-        if self.username:
-            try:
-                config_content = self.shell.fs.read_file(
-                    f"/home/{self.username}/.kiki-config", "root"
-                )
-                if config_content:
-                    user_config = json.loads(config_content)
-                    desktop_config = user_config.get("desktop", {})
-                    self.desktop_icon_names = desktop_config.get("icon_names", {})
-                    self.desktop_icon_positions = desktop_config.get("icon_positions", {})
-            except Exception:
-                self.desktop_icon_names = {}
-                self.desktop_icon_positions = {}
-        else:
-            self.desktop_icon_names = {}
-            self.desktop_icon_positions = {}
+        # ========== 3. 从配置读图标位置 ==========
+        self._load_icon_positions()
 
+        # ========== 4. 固定图标 ==========
         fixed_icons = [
             ("🖥️", "我的电脑", lambda: self._open_fm_at("/")),
             ("♻️", "回收站", self._open_trash),
@@ -28874,79 +29366,163 @@ class KIKIGUI(ctk.CTk):
         for idx, (icon, label, cmd) in enumerate(fixed_icons):
             icon_id = f"fixed_{label}"
             if icon_id in self.desktop_icon_positions:
-                saved_x, saved_y = self.desktop_icon_positions[icon_id]
-                if (saved_x - 20) % self.icon_grid_x == 0 and (saved_y - 20) % self.icon_grid_y == 0:
-                    x, y = saved_x, saved_y
-                else:
-                    x, y = 20, 20 + idx * 90
+                x, y = self.desktop_icon_positions[icon_id]
             else:
                 x, y = 20, 20 + idx * 90
-
-            btn = ctk.CTkButton(
-                self.icon_frame,
-                text=f"{icon}\n{label}",
-                width=self.icon_size,
-                height=self.icon_size,
-                command=None,
-                font=("Arial", self.icon_font_size),
-                fg_color="transparent",
-                hover_color="#4a9eff",
-                border_width=0,
-                corner_radius=8,
+            self._make_desktop_icon_widget(
+                icon_id, icon, label,
+                path=None, is_dynamic=False, cmd=cmd,
+                x=x, y=y, icon_type="fixed",
             )
-            btn.place(x=x, y=y)
-            self.desktop_icons[icon_id] = {
-                "widget": btn,
-                "name": label,
-                "path": None,
-                "is_dynamic": False,
-                "command": cmd,
-            }
-            self.desktop_icon_positions[icon_id] = (x, y)
 
-            btn.bind("<ButtonPress-1>", lambda e, iid=icon_id, b=btn: self._on_icon_press(e, iid, b))
-            btn.bind("<B1-Motion>", lambda e, iid=icon_id, b=btn: self._on_icon_drag(e, iid, b))
-            btn.bind("<ButtonRelease-1>", lambda e, iid=icon_id, b=btn: self._on_icon_release(e, iid, b))
-            btn.bind("<Button-3>", lambda e, iid=icon_id, b=btn: self._desktop_icon_right_click(e, iid, b))
-
+        # ========== 5. 从 VFS Desktop 同步 ==========
         if self.username:
-            self._restore_dynamic_icons()
-        self._save_dynamic_icons()
+            self._sync_desktop_from_vfs()
 
-    def _add_desktop_icon(self, target_path, display_name=None, x=None, y=None):
-        if not target_path:
-            return None
-        if display_name is None:
-            display_name = os.path.basename(target_path)
-            if not display_name:
-                display_name = "快捷方式"
+        # ========== 6. 保存位置 ==========
+        self._save_icon_positions()
 
-        for icon_id, info in self.desktop_icons.items():
-            if info.get("path") == target_path:
-                return info["widget"]
+    def _load_icon_positions(self):
+        """从用户配置读取图标位置"""
+        if not self.username:
+            return
+        try:
+            config_content = self.shell.fs.read_file(
+                f"/home/{self.username}/.kiki-config", "root"
+            )
+            if config_content:
+                user_config = json.loads(config_content)
+                desktop_config = user_config.get("desktop", {})
+                self.desktop_icon_positions = desktop_config.get("icon_positions", {})
+        except Exception:
+            pass
 
-        node = self.shell.fs.resolve(target_path, self.username)
-        if node is None:
+    def _save_icon_positions(self):
+        """把图标位置写回用户配置"""
+        if not self.username:
+            return
+        try:
+            desktop = self.shell.config.config.setdefault("desktop", {})
+            desktop["icon_positions"] = self.desktop_icon_positions
+            desktop["icon_names"] = self.desktop_icon_names
+            self.shell.config.save_user_config(self.username)
+        except Exception:
+            pass
+
+    def _sync_desktop_from_vfs(self):
+        """扫描 /home/{user}/Desktop/ 目录，为每个文件创建图标"""
+        desktop_path = f"/home/{self.username}/Desktop"
+        if not self.shell.fs.resolve(desktop_path, self.username):
+            return
+
+        items = self.shell.fs.listdir(desktop_path, self.username) or []
+        # 排序：文件夹在前，文件在后
+        dirs = []
+        files = []
+        for name in items:
+            full = f"{desktop_path}/{name}"
+            node = self.shell.fs.resolve(full, self.username)
+            if isinstance(node, Directory):
+                dirs.append(name)
+            else:
+                files.append(name)
+        dirs.sort(key=lambda x: x.lower())
+        files.sort(key=lambda x: x.lower())
+        sorted_items = dirs + files
+
+        # 固定图标已经占了前 6 个位置，从第 7 个开始布局
+        base_offset = 6
+        for idx, name in enumerate(sorted_items):
+            full_path = f"{desktop_path}/{name}"
+            node = self.shell.fs.resolve(full_path, self.username)
+            if node is None:
+                continue
+
+            icon_id = f"vfs:{name}"
+            if icon_id in self.desktop_icons:
+                continue
+
+            # 位置
+            if icon_id in self.desktop_icon_positions:
+                x, y = self.desktop_icon_positions[icon_id]
+            else:
+                # 自动布局：每行 5 个
+                row = (base_offset + idx) // 5
+                col = (base_offset + idx) % 5
+                x = 20 + col * 90
+                y = 20 + row * 90
+
+            if isinstance(node, Directory):
+                self._make_desktop_icon_widget(
+                    icon_id, "📁", name,
+                    path=full_path, is_dynamic=True,
+                    cmd=(lambda p=full_path: self._open_fm_at(p)),
+                    x=x, y=y, icon_type="folder",
+                )
+            elif isinstance(node, File):
+                if name.endswith(".shortcut"):
+                    self._load_shortcut_icon(icon_id, full_path, node, x, y)
+                else:
+                    ext = os.path.splitext(name)[1].lower()
+                    icon_symbol = self._get_file_icon_symbol(ext)
+                    self._make_desktop_icon_widget(
+                        icon_id, icon_symbol, name,
+                        path=full_path, is_dynamic=True,
+                        cmd=(lambda p=full_path: self._open_desktop_icon(p)),
+                        x=x, y=y, icon_type="file",
+                    )
+
+    def _get_file_icon_symbol(self, ext):
+        """根据扩展名返回图标符号"""
+        icon_map = {
+            ".py": "📜", ".sh": "📜", ".bat": "📜", ".js": "📜",
+            ".jpg": "🖼️", ".jpeg": "🖼️", ".png": "🖼️", ".gif": "🖼️", ".bmp": "🖼️",
+            ".mp3": "🎵", ".wav": "🎵", ".flac": "🎵",
+            ".mp4": "🎬", ".avi": "🎬", ".mkv": "🎬",
+            ".zip": "📦", ".rar": "📦", ".7z": "📦",
+            ".pdf": "📕",
+            ".doc": "📘", ".docx": "📘",
+            ".xls": "📗", ".xlsx": "📗",
+            ".ppt": "📙", ".pptx": "📙",
+        }
+        return icon_map.get(ext, "📄")
+
+    def _load_shortcut_icon(self, icon_id, shortcut_path, node, x, y):
+        """解析 .shortcut 文件并创建图标"""
+        try:
+            data = json.loads(node.content)
+        except Exception:
+            return
+        target = data.get("target", "")
+        display_name = data.get("name", os.path.basename(target) if target else "快捷方式")
+        sx = data.get("x", x)
+        sy = data.get("y", y)
+
+        # 判断 target 类型
+        tn = self.shell.fs.resolve(target, self.username) if target else None
+        if tn is None:
             icon_symbol = "❓"
-        elif isinstance(node, Directory):
-            icon_symbol = "📁"
+        elif isinstance(tn, Directory):
+            icon_symbol = "📁🔗"
         else:
-            ext = os.path.splitext(display_name)[1].lower()
-            icon_map = {
-                ".py": "📜", ".sh": "📜", ".bat": "📜",
-                ".jpg": "🖼️", ".png": "🖼️", ".gif": "🖼️",
-                ".mp3": "🎵", ".wav": "🎵",
-                ".mp4": "🎬", ".avi": "🎬",
-                ".zip": "📦", ".rar": "📦",
-            }
-            icon_symbol = icon_map.get(ext, "📄")
+            ext = os.path.splitext(target)[1].lower()
+            icon_symbol = self._get_file_icon_symbol(ext) + "🔗"
 
-        def open_path_command():
-            self._open_desktop_icon(target_path)
+        self._make_desktop_icon_widget(
+            icon_id, icon_symbol, display_name,
+            path=target, is_dynamic=True,
+            cmd=(lambda t=target: self._open_desktop_icon(t)),
+            x=sx, y=sy, icon_type="shortcut",
+            shortcut_file=shortcut_path,
+        )
 
+    def _make_desktop_icon_widget(self, icon_id, icon_symbol, label,
+                                   path, is_dynamic, cmd,
+                                   x, y, icon_type="file", shortcut_file=None):
+        """统一的图标控件创建"""
         btn = ctk.CTkButton(
             self.icon_frame,
-            text=f"{icon_symbol}\n{display_name}",
+            text=f"{icon_symbol}\n{label}",
             width=self.icon_size,
             height=self.icon_size,
             command=None,
@@ -28956,39 +29532,6 @@ class KIKIGUI(ctk.CTk):
             border_width=0,
             corner_radius=8,
         )
-
-        if x is None or y is None:
-            dynamic_list = self.shell.config.config.get("desktop", {}).get("dynamic_icons", [])
-            found = False
-            for item in dynamic_list:
-                if item.get("path") == target_path:
-                    x = item.get("x")
-                    y = item.get("y")
-                    found = True
-                    break
-            if not found:
-                empty_slot = self._find_empty_grid_slot()
-                if empty_slot:
-                    x, y = empty_slot
-                else:
-                    max_y = 20
-                    for info in self.desktop_icons.values():
-                        w = info.get("widget")
-                        if w and w.winfo_exists():
-                            wy = w.winfo_y()
-                            max_y = max(max_y, wy)
-                    x, y = 20, max_y + 90
-            if x is None or y is None:
-                x, y = 20, 20
-
-        # 仅做边界检查，不再网格对齐
-        if x < 0: x = 20
-        if y < 0: y = 20
-        x = max(0, min(x, self.icon_frame.winfo_width() - self.icon_size))
-        y = max(0, min(y, self.icon_frame.winfo_height() - self.icon_size))
-
-        icon_id = f"dynamic_{self.dynamic_icon_counter}"
-        self.dynamic_icon_counter += 1
         btn.place(x=x, y=y)
 
         btn.bind("<ButtonPress-1>", lambda e, iid=icon_id, b=btn: self._on_icon_press(e, iid, b))
@@ -28998,30 +29541,149 @@ class KIKIGUI(ctk.CTk):
 
         self.desktop_icons[icon_id] = {
             "widget": btn,
-            "name": display_name,
-            "path": target_path,
-            "is_dynamic": True,
-            "command": open_path_command,
+            "name": label,
+            "path": path,
+            "is_dynamic": is_dynamic,
+            "command": cmd,
+            "icon_type": icon_type,
+            "shortcut_file": shortcut_file,
         }
         self.desktop_icon_positions[icon_id] = (x, y)
-        self._save_dynamic_icons()
+        self.desktop_icon_names[icon_id] = label
         return btn
 
-    def _find_empty_grid_slot(self):
-        """寻找第一个空闲网格位置"""
+    def _add_desktop_icon(self, target_path, display_name=None, x=None, y=None):
+        """创建桌面快捷方式（同时写 .shortcut 文件到 VFS Desktop）"""
+        if not target_path:
+            return None
+        if display_name is None:
+            display_name = os.path.basename(target_path)
+            if not display_name:
+                display_name = "快捷方式"
+
+        # 已存在同 target 的快捷方式 → 直接返回
+        for icon_id, info in self.desktop_icons.items():
+            if info.get("icon_type") == "shortcut" and info.get("path") == target_path:
+                return info["widget"]
+
+        # 位置
+        if x is None or y is None:
+            empty_slot = self._find_empty_grid_slot()
+            if empty_slot:
+                x, y = empty_slot
+            else:
+                x, y = 20, 20
+
+        # 写 .shortcut 文件
+        shortcut_path = self._write_shortcut_file(target_path, display_name, x, y)
+        if not shortcut_path:
+            return None
+
+        # 从 VFS 重新扫描（会加载 .shortcut 图标）
+        icon_id = f"vfs:{os.path.basename(shortcut_path)}"
+        if icon_id in self.desktop_icons:
+            return self.desktop_icons[icon_id]["widget"]
+
+        # 兜底：直接创建（正常流程 _sync_desktop_from_vfs 已经处理）
+        tn = self.shell.fs.resolve(target_path, self.username)
+        if tn is None:
+            icon_symbol = "❓"
+        elif isinstance(tn, Directory):
+            icon_symbol = "📁🔗"
+        else:
+            ext = os.path.splitext(target_path)[1].lower()
+            icon_symbol = self._get_file_icon_symbol(ext) + "🔗"
+
+        self._make_desktop_icon_widget(
+            icon_id, icon_symbol, display_name,
+            path=target_path, is_dynamic=True,
+            cmd=(lambda t=target_path: self._open_desktop_icon(t)),
+            x=x, y=y, icon_type="shortcut",
+            shortcut_file=shortcut_path,
+        )
+        self._save_icon_positions()
+        return self.desktop_icons[icon_id]["widget"]
+
+    def _write_shortcut_file(self, target_path, display_name, x, y):
+        """把快捷方式元数据写入 /home/{user}/Desktop/xxx.shortcut"""
+        desktop_path = f"/home/{self.username}/Desktop"
+        if not self.shell.fs.resolve(desktop_path, self.username):
+            try:
+                self.shell.fs.mkdir(desktop_path, self.username)
+            except Exception:
+                return None
+
+        # 文件名 + 序号避免冲突
+        base_name = display_name
+        filename = f"{base_name}.shortcut"
+        shortcut_path = f"{desktop_path}/{filename}"
+        counter = 1
+        while self.shell.fs.resolve(shortcut_path, self.username):
+            existing = self.shell.fs.resolve(shortcut_path, self.username)
+            if isinstance(existing, File):
+                try:
+                    data = json.loads(existing.content)
+                    if data.get("target") == target_path:
+                        return shortcut_path
+                except Exception:
+                    pass
+            counter += 1
+            filename = f"{base_name}_{counter}.shortcut"
+            shortcut_path = f"{desktop_path}/{filename}"
+
+        data = {
+            "target": target_path,
+            "name": display_name,
+            "x": x,
+            "y": y,
+        }
+        try:
+            self.shell.fs.write_file(
+                shortcut_path,
+                json.dumps(data, ensure_ascii=False, indent=2),
+                self.username,
+            )
+            return shortcut_path
+        except Exception as e:
+            print(f"[桌面] 写快捷方式失败: {e}")
+            return None
+
+    def _find_empty_grid_slot(self, target_x=None, target_y=None):
+        """寻找空闲网格。
+        - 给了 target_x/target_y：返回离它最近的空闲格
+        - 没给：返回从左到右、从上到下第一个空格（兼容旧调用）
+        """
         origin_x = 20
         origin_y = 20
         grid_x = self.icon_grid_x
         grid_y = self.icon_grid_y
         max_col = max(1, int((self.icon_frame.winfo_width() - origin_x) // grid_x))
         max_row = max(1, int((self.icon_frame.winfo_height() - origin_y) // grid_y))
+
+        # 先收集所有空闲格
+        empty_slots = []
         for row in range(max_row):
             for col in range(max_col):
                 pos_x = origin_x + col * grid_x
                 pos_y = origin_y + row * grid_y
                 if not self._is_position_occupied(pos_x, pos_y):
-                    return (pos_x, pos_y)
-        return None
+                    empty_slots.append((pos_x, pos_y))
+
+        if not empty_slots:
+            return None
+
+        # 没给目标 → 返回第一个（兼容旧行为）
+        if target_x is None or target_y is None:
+            return empty_slots[0]
+
+        # 给了目标 → 按到目标的欧氏距离平方排序，返回最近的
+        def dist_sq(slot):
+            dx = slot[0] - target_x
+            dy = slot[1] - target_y
+            return dx * dx + dy * dy
+
+        empty_slots.sort(key=dist_sq)
+        return empty_slots[0]
 
     def _on_icon_press(self, event, icon_id, btn):
         self._hide_delete_buttons()
@@ -29060,6 +29722,12 @@ class KIKIGUI(ctk.CTk):
 
         btn._press_timer = btn.after(600, long_press)
 
+        # ★ 按下时立即置顶，避免拖拽过程中被其他图标遮住
+        try:
+            btn.lift()
+        except Exception:
+            pass
+
     def _on_icon_drag(self, event, icon_id, btn):
         if icon_id not in self.desktop_icons:
             return
@@ -29087,7 +29755,7 @@ class KIKIGUI(ctk.CTk):
                 btn._click_count = 0
                 # 禁用 hover 效果，避免闪烁
                 btn.configure(hover_color="transparent", fg_color="transparent")
-                btn.lift()
+                btn.place(x=new_x, y=new_y)
 
             offset = self.icon_size // 2
             raw_x = event.x_root - self.icon_frame.winfo_rootx() - offset
@@ -29109,6 +29777,10 @@ class KIKIGUI(ctk.CTk):
             if (new_x, new_y) != btn._last_drag_pos:
                 btn._last_drag_pos = (new_x, new_y)
                 btn.place(x=new_x, y=new_y)
+                try:
+                    btn.lift()      # ★ 每帧置顶，防止被后创建的图标盖住
+                except Exception:
+                    pass
 
     def _on_icon_release(self, event, icon_id, btn):
         self._hide_delete_buttons()
@@ -29190,40 +29862,51 @@ class KIKIGUI(ctk.CTk):
             return
         info = self.desktop_icons[icon_id]
         old_name = info["name"]
-        cur_x = btn.winfo_x()
-        cur_y = btn.winfo_y()
-        btn.place_forget()
-        entry = tk.Entry(
-            self.icon_frame,
-            font=("Arial", self.icon_font_size),
-            bg="#2b2b2b",
-            fg="white",
-            insertbackground="white",
-            relief="flat",
-            width=max(10, len(old_name) + 2),
+        icon_type = info.get("icon_type", "file")
+
+        new_name = simpledialog.askstring(
+            "重命名", "新名称:", initialvalue=old_name, parent=self
         )
-        entry.place(x=cur_x, y=cur_y, width=self.icon_size, height=self.icon_size)
-        entry.insert(0, old_name)
-        entry.select_range(0, tk.END)
-        entry.focus_force()
-        entry.icursor(tk.END)
+        if not new_name:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == old_name:
+            return
 
-        def finish(ok=True):
-            new_name = entry.get().strip() if ok else old_name
-            if not new_name:
-                new_name = old_name
-            icon_symbol = btn.cget("text").split("\n")[0]
-            btn.configure(text=f"{icon_symbol}\n{new_name}")
-            info["name"] = new_name
-            # 恢复位置，并再次对齐网格
-            btn.place(x=cur_x, y=cur_y)
-            self._perform_snap_and_push(btn, icon_id)  # 强制吸附到网格
-            entry.destroy()
-            self._save_dynamic_icons()
+        desktop_path = f"/home/{self.username}/Desktop"
 
-        entry.bind("<Return>", lambda e: finish(True))
-        entry.bind("<FocusOut>", lambda e: finish(False))
-        self.bind_all("<Button-1>", lambda e: finish(False) if entry.winfo_exists() else None)
+        if icon_type == "shortcut":
+            shortcut_file = info.get("shortcut_file")
+            if not shortcut_file:
+                return
+            try:
+                node = self.shell.fs.resolve(shortcut_file, self.username)
+                data = json.loads(node.content)
+                data["name"] = new_name
+                self.shell.fs.write_file(
+                    shortcut_file,
+                    json.dumps(data, ensure_ascii=False, indent=2),
+                    self.username,
+                )
+                # 若文件名也变，一起移动
+                new_file = f"{desktop_path}/{new_name}.shortcut"
+                if new_file != shortcut_file and not self.shell.fs.resolve(new_file, self.username):
+                    self.shell.fs.move(shortcut_file, new_file, self.username)
+            except Exception as e:
+                messagebox.showerror("错误", f"重命名失败: {e}")
+                return
+        else:
+            old_path = f"{desktop_path}/{old_name}"
+            new_path = f"{desktop_path}/{new_name}"
+            if self.shell.fs.resolve(new_path, self.username):
+                messagebox.showerror("错误", f"'{new_name}' 已存在")
+                return
+            if not self.shell.fs.move(old_path, new_path, self.username):
+                messagebox.showerror("错误", "重命名失败")
+                return
+
+        # 全量刷新桌面
+        self._create_desktop_icons()
 
     def _cancel_press_timer(self, btn):
         """取消长按计时器"""
@@ -29259,53 +29942,6 @@ class KIKIGUI(ctk.CTk):
         sys.__stdout__.write(f"[KIKI-DEBUG] {msg}\n")
         sys.__stdout__.flush()
 
-    def _restore_dynamic_icons(self):
-        if not self.username:
-            return
-        # 强制重新加载配置（确保最新）
-        try:
-            self.shell.config.load_user_config(self.username)
-        except Exception:
-            pass
-        dynamic_list = self.shell.config.config.get("desktop", {}).get("dynamic_icons", [])
-        if not dynamic_list:
-            return
-        for item in dynamic_list:
-            path = item.get("path")
-            name = item.get("name")
-            x = item.get("x")
-            y = item.get("y")
-            if path and x is not None and y is not None:
-                self._add_desktop_icon(path, name, x=x, y=y)
-
-    def _save_dynamic_icons(self):
-        if not self.username:
-            return
-        desktop = self.shell.config.config.get("desktop", {})
-        # 保存所有图标名称
-        desktop["icon_names"] = {
-            icon_id: info["name"] for icon_id, info in self.desktop_icons.items()
-        }
-        # 保存所有图标位置（包括固定图标）
-        desktop["icon_positions"] = {
-            icon_id: self.desktop_icon_positions[icon_id]
-            for icon_id, info in self.desktop_icons.items()
-            if info.get("widget") and info["widget"].winfo_exists()
-        }
-        # 保存动态图标列表
-        desktop["dynamic_icons"] = [
-            {
-                "name": info["name"],
-                "path": info["path"],
-                "x": self.desktop_icon_positions[icon_id][0],
-                "y": self.desktop_icon_positions[icon_id][1],
-            }
-            for icon_id, info in self.desktop_icons.items()
-            if info.get("is_dynamic") and info.get("widget") and info["widget"].winfo_exists()
-        ]
-        self.shell.config.config["desktop"] = desktop
-        self.shell.config.save_user_config(self.username)
-
     def _save_desktop_icon_positions(self):
         """保存图标位置到配置"""
         self.shell.config.set("desktop.icon_positions", self.desktop_icon_positions, self.username)
@@ -29339,7 +29975,7 @@ class KIKIGUI(ctk.CTk):
                 pass
 
         del self.desktop_icons[icon_id]
-        self._save_dynamic_icons()
+        self._save_icon_positions()
         return True
 
     def _open_desktop_icon(self, target_path):
@@ -32746,15 +33382,43 @@ class KIKIGUI(ctk.CTk):
             self._update_dock()
 
     def on_file_deleted(self):
-        print(f"[DEBUG] on_file_deleted called, pet={self.pet}")  # 输出到终端
         if self.pet is None:
-            print("[DEBUG] Pet is None, recreating...")
             self.pet = Pet(self)
             self.pet.window.deiconify()
         if self.pet:
             self.pet.react_to_event("delete")
         else:
-            print("[DEBUG] Failed to create pet")
+            pass
+
+    def _watch_desktop(self):
+        """每 2 秒扫一次 VFS Desktop 目录，有变化就重建图标"""
+        if getattr(self, "_closing", False):
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+
+        try:
+            if self.username:
+                desktop_path = f"/home/{self.username}/Desktop"
+                node = self.shell.fs.resolve(desktop_path, self.username)
+                if node and isinstance(node, Directory):
+                    current = set(node.list_children(self.username) or [])
+                    prev = getattr(self, "_last_desktop_snapshot", None)
+                    # 首次只记录快照，不刷新（避免登录时闪烁）
+                    if prev is not None and current != prev:
+                        print(f"[桌面] 检测到 Desktop 变化，刷新图标")
+                        self._create_desktop_icons()
+                    self._last_desktop_snapshot = current
+        except Exception:
+            pass
+
+        try:
+            self.after(2000, self._watch_desktop)
+        except Exception:
+            pass
 
     def _close(self):
         self._closing = True
@@ -37134,3 +37798,4 @@ if __name__ == "__main__":
     # ==================== 默认：启动 GUI ====================
     app = KIKIGUI()
     app.mainloop()
+# https://github.com/Robin-KK-Lab
